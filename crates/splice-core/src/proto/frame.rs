@@ -299,10 +299,7 @@ mod tests {
     #[test]
     fn flags_roundtrip() {
         assert_eq!(FrameFlags::from_byte(0).unwrap(), FrameFlags::NONE);
-        assert_eq!(
-            FrameFlags::from_byte(1).unwrap(),
-            FrameFlags::COMPRESSED
-        );
+        assert_eq!(FrameFlags::from_byte(1).unwrap(), FrameFlags::COMPRESSED);
         assert!(FrameFlags::COMPRESSED.contains(FrameFlags::COMPRESSED));
         assert!(!FrameFlags::NONE.contains(FrameFlags::COMPRESSED));
         assert!(FrameFlags::from_byte(0x80).is_err());

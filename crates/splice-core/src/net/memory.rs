@@ -46,10 +46,6 @@ impl Flag {
         Self { tx }
     }
 
-    fn is_closed(&self) -> bool {
-        *self.tx.borrow()
-    }
-
     fn close(&self) {
         // `send_replace` always updates the value and never fails; `send` would
         // fail when no receiver currently exists, silently dropping the close.
@@ -217,7 +213,8 @@ impl Transport for MemoryTransport {
                     alpn,
                     pipe: Mutex::new(Some(pipe)),
                     closed: Flag::new(),
-                }) as Arc<dyn Connection>)),
+                })
+                    as Arc<dyn Connection>)),
             }
         })
     }

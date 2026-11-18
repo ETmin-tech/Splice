@@ -1,4 +1,4 @@
-﻿//! Spike S1 — does iroh 1.4.1 work on a LAN with **no internet and no relay**?
+//! Spike S1 — does iroh 1.4.1 work on a LAN with **no internet and no relay**?
 //!
 //! Throwaway measurement harness for `MasterPrompt-Fase1.md` §4 Step 1.
 //! Every subcommand prints newline-delimited JSON on stdout so the driver script can

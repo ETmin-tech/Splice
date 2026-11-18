@@ -9,6 +9,8 @@
 //! (direct or relay), because the UI has to tell the user which path is in use.
 
 mod iroh_impl;
+
+pub use iroh_impl::REQUIRED_ALPN;
 pub mod memory;
 
 use std::future::Future;

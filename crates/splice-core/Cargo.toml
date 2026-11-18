@@ -14,7 +14,6 @@ tokio = { workspace = true, features = ["net", "sync", "time", "macros"] }
 serde.workspace = true
 postcard.workspace = true
 blake3.workspace = true
-spake2.workspace = true
 zeroize.workspace = true
 rand.workspace = true
 getrandom.workspace = true
@@ -24,7 +23,8 @@ dirs.workspace = true
 mdns-sd.workspace = true
 socket2.workspace = true
 data-encoding.workspace = true
-serde_json.workspace = true
+if-addrs.workspace = true
+subtle.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]

@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr};
+use iroh::{
+    endpoint::presets, Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, TransportAddr,
+};
 
 use crate::{emit, ms, ALPN, STREAM_TYPE_CONTROL};
 
@@ -170,7 +172,9 @@ async fn dual_identity_probe(
         .context("dual-identity connect")?;
     let connect_ms = ms(t0.elapsed());
     let (mut send, _recv) = conn.open_bi().await.context("open bi")?;
-    send.write_all(&[STREAM_TYPE_CONTROL]).await.context("write type")?;
+    send.write_all(&[STREAM_TYPE_CONTROL])
+        .await
+        .context("write type")?;
     send.finish().context("finish")?;
     let seen = tokio::time::timeout(Duration::from_secs(10), rx)
         .await

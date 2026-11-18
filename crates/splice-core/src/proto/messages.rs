@@ -210,9 +210,7 @@ pub fn sanitize_alias(raw: &str) -> Result<String, Error> {
 ///
 /// The supertraits carry the `postcard` bounds, so a generic `M: WireMessage`
 /// can encode and decode without restating them at every call site.
-pub trait WireMessage:
-    Serialize + for<'de> Deserialize<'de> + Sized + std::fmt::Debug
-{
+pub trait WireMessage: Serialize + for<'de> Deserialize<'de> + Sized + std::fmt::Debug {
     /// Encode into a CONTROL body. Never allocates more than the message needs.
     fn encode_to_vec(&self) -> Result<Vec<u8>, Error> {
         postcard::to_stdvec(self).map_err(|err| ProtoError::Encode(err.to_string()).into())
@@ -224,8 +222,8 @@ pub trait WireMessage:
     /// a body with slack is either a mismatch between the declared length and the
     /// message or an attempt to smuggle data past the decoder (I9).
     fn decode_from_slice(bytes: &[u8]) -> Result<Self, Error> {
-        let (message, rest) = postcard::take_from_bytes(bytes)
-            .map_err(|err| ProtoError::Decode(err.to_string()))?;
+        let (message, rest) =
+            postcard::take_from_bytes(bytes).map_err(|err| ProtoError::Decode(err.to_string()))?;
         if !rest.is_empty() {
             return Err(ProtoError::Decode(format!(
                 "{} trailing byte(s) after the message",

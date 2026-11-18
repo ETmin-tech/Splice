@@ -173,7 +173,9 @@ mod tests {
         let id: [u8; 32] = [0u8; 32];
         let label = base32_lower(&iroh::EndpointId::from_bytes(&id).unwrap());
         assert_eq!(label.len(), 52, "got {label}");
-        assert!(label.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert!(label
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
         assert_eq!(label, "a".repeat(52));
     }
 }

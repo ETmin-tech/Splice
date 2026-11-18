@@ -57,7 +57,9 @@ pub async fn run() -> Result<()> {
 
     let (mut send, mut recv) = conn.open_bi().await.context("open bi")?;
     let payload = b"hello-splice";
-    send.write_all(&[STREAM_TYPE_CONTROL]).await.context("write type")?;
+    send.write_all(&[STREAM_TYPE_CONTROL])
+        .await
+        .context("write type")?;
     send.write_all(payload).await.context("write payload")?;
     send.finish().context("finish")?;
     let client_res: Result<(u8, Vec<u8>)> = async {
@@ -122,9 +124,14 @@ pub async fn run() -> Result<()> {
     // --- negative 2: unknown stream type byte must be refused by our accept path ---
     let server_task = tokio::spawn(serve_one(server.clone()));
     let target = EndpointAddr::from_parts(server.id(), [TransportAddr::Ip(server_addr)]);
-    let conn = client.connect(target, ALPN).await.context("connect for bad type")?;
+    let conn = client
+        .connect(target, ALPN)
+        .await
+        .context("connect for bad type")?;
     let (mut send, _recv) = conn.open_bi().await.context("open bi")?;
-    send.write_all(&[STREAM_TYPE_UNKNOWN]).await.context("write type")?;
+    send.write_all(&[STREAM_TYPE_UNKNOWN])
+        .await
+        .context("write type")?;
     send.finish().context("finish")?;
     let bad_type_result = server_task.await.context("server task panicked")?;
     emit(serde_json::json!({

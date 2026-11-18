@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::endpoint::presets;
-use iroh::{Endpoint, EndpointAddr, RelayMode, TransportAddr};
+use iroh::{Endpoint, EndpointAddr, RelayMode};
 
 use super::{
     BoxFuture, Connection, EndpointConfig, NodeAddr, PathKind, RecvStream, RelaySetting, Result,
@@ -34,11 +34,9 @@ pub async fn bind(config: EndpointConfig) -> Result<Arc<dyn Transport>> {
     builder = match &config.relay {
         RelaySetting::Disabled => builder.relay_mode(RelayMode::Disabled),
         RelaySetting::Default => builder.relay_mode(RelayMode::Default),
-        RelaySetting::Custom(url) => builder.relay_mode(RelayMode::custom(
-            [url
-                .parse::<iroh::RelayUrl>()
-                .map_err(|err| NetError::Transport(format!("relay url {url:?}: {err}")))?],
-        )),
+        RelaySetting::Custom(url) => builder.relay_mode(RelayMode::custom([url
+            .parse::<iroh::RelayUrl>()
+            .map_err(|err| NetError::Transport(format!("relay url {url:?}: {err}")))?])),
     };
 
     if let Some(addr) = config.bind {
@@ -116,7 +114,9 @@ impl Transport for IrohTransport {
                     let conn = incoming
                         .await
                         .map_err(|err| NetError::Transport(err.to_string()))?;
-                    Ok(Some(Arc::new(IrohConnection { inner: conn }) as Arc<dyn Connection>))
+                    Ok(Some(
+                        Arc::new(IrohConnection { inner: conn }) as Arc<dyn Connection>
+                    ))
                 }
             }
         })
@@ -195,8 +195,3 @@ impl Connection for IrohConnection {
 
 /// The ALPN every real connection must have negotiated.
 pub const REQUIRED_ALPN: &[u8] = ALPN;
-
-/// `TransportAddr` helpers kept here so the rest of the crate never imports iroh.
-pub(crate) fn ip_hints(addrs: impl IntoIterator<Item = std::net::SocketAddr>) -> Vec<TransportAddr> {
-    addrs.into_iter().map(TransportAddr::Ip).collect()
-}

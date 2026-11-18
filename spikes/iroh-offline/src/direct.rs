@@ -138,4 +138,3 @@ fn secret_or_random() -> iroh::SecretKey {
     emit(serde_json::json!({ "event": "identity", "id": key.public().to_string() }));
     key
 }
-

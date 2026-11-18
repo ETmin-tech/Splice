@@ -247,7 +247,10 @@ mod tests {
             Code::parse("7-torch-crys_tal").unwrap_err(),
             CodeError::InvalidCharacter
         );
-        assert_eq!(Code::parse(&"a".repeat(65)).unwrap_err(), CodeError::TooLong);
+        assert_eq!(
+            Code::parse(&"a".repeat(65)).unwrap_err(),
+            CodeError::TooLong
+        );
     }
 
     #[test]
@@ -292,7 +295,10 @@ mod tests {
         assert_eq!(WordCount::Three.entropy_bits(), 33);
         assert_eq!(WordCount::from_count(2).unwrap(), WordCount::Two);
         assert_eq!(WordCount::from_count(3).unwrap(), WordCount::Three);
-        assert_eq!(WordCount::from_count(4), Err(CodeError::WordCountOutOfRange));
+        assert_eq!(
+            WordCount::from_count(4),
+            Err(CodeError::WordCountOutOfRange)
+        );
     }
 
     mod props {
@@ -300,8 +306,14 @@ mod tests {
         use proptest::prelude::*;
 
         fn arb_code() -> impl Strategy<Value = Code> {
-            (1u16..=999, 0usize..2048, 0usize..2048, 0usize..2048, any::<bool>()).prop_map(
-                |(plate, a, b, c, three)| {
+            (
+                1u16..=999,
+                0usize..2048,
+                0usize..2048,
+                0usize..2048,
+                any::<bool>(),
+            )
+                .prop_map(|(plate, a, b, c, three)| {
                     let nameplate = Nameplate::new(plate).unwrap();
                     let words: &[&'static str] = if three {
                         &[WORDS[a], WORDS[b], WORDS[c]]
@@ -309,8 +321,7 @@ mod tests {
                         &[WORDS[a], WORDS[b]]
                     };
                     Code::from_parts(nameplate, words).unwrap()
-                },
-            )
+                })
         }
 
         proptest! {

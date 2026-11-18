@@ -13,6 +13,6 @@ mod store;
 
 pub use keys::{NodeId, NodeSecret};
 pub use store::{
-    config_dir, load_or_create_persistent, load_persistent, reset_persistent, IdentitySource,
-    IDENTITY_FILE,
+    config_dir, display_path, exists, load_or_create_persistent, load_persistent, peek_node_id,
+    read_raw, reset_persistent, save_persistent, IdentitySource, CONFIG_DIR_ENV, IDENTITY_FILE,
 };

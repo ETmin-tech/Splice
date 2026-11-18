@@ -114,11 +114,23 @@ mod tests {
     #[test]
     fn parses_only_digits() {
         assert_eq!("42".parse::<Nameplate>().unwrap().get(), 42);
-        assert_eq!("7".parse::<Nameplate>().unwrap(), Nameplate::new(7).unwrap());
+        assert_eq!(
+            "7".parse::<Nameplate>().unwrap(),
+            Nameplate::new(7).unwrap()
+        );
         assert_eq!("".parse::<Nameplate>(), Err(CodeError::Shape));
-        assert_eq!("7a".parse::<Nameplate>(), Err(CodeError::NameplateNotNumeric));
-        assert_eq!("-7".parse::<Nameplate>(), Err(CodeError::NameplateNotNumeric));
-        assert_eq!("1000".parse::<Nameplate>(), Err(CodeError::NameplateOutOfRange));
+        assert_eq!(
+            "7a".parse::<Nameplate>(),
+            Err(CodeError::NameplateNotNumeric)
+        );
+        assert_eq!(
+            "-7".parse::<Nameplate>(),
+            Err(CodeError::NameplateNotNumeric)
+        );
+        assert_eq!(
+            "1000".parse::<Nameplate>(),
+            Err(CodeError::NameplateOutOfRange)
+        );
         assert_eq!(
             "99999".parse::<Nameplate>(),
             Err(CodeError::NameplateOutOfRange)

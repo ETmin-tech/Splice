@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod clock;
 pub mod code;
 pub mod constants;
 pub mod discovery;

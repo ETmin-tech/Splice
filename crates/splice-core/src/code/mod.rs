@@ -9,7 +9,7 @@ mod parse;
 mod wordlist;
 
 pub use nameplate::Nameplate;
-pub use parse::{Code, WordCount};
+pub use parse::{parse_code, Code, WordCount};
 pub use wordlist::WORDS;
 
 #[cfg(test)]
