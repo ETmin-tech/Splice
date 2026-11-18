@@ -1,0 +1,33 @@
+[package]
+name = "splice-core"
+description = "Core library for splice: identity, codes, discovery, pairing, trust store, wire protocol."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+iroh.workspace = true
+tokio = { workspace = true, features = ["net", "sync", "time", "macros"] }
+serde.workspace = true
+postcard.workspace = true
+blake3.workspace = true
+spake2.workspace = true
+zeroize.workspace = true
+rand.workspace = true
+getrandom.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+dirs.workspace = true
+mdns-sd.workspace = true
+socket2.workspace = true
+data-encoding.workspace = true
+serde_json.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "macros"] }
+proptest = "1"
+tempfile = "3"
