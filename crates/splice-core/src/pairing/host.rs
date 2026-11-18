@@ -23,6 +23,7 @@ use crate::constants::{HANDSHAKE_TIMEOUT, PAIRING_ATTEMPTS_MAX, PAIRING_CODE_TTL
 use crate::error::{PairingError, Result};
 use crate::identity::NodeId;
 use crate::proto::messages::{ByeReason, ControlMsg, HelloMode};
+use crate::secret::SecretString;
 
 use super::confirm::{confirm_mac, verify_mac, Transcript};
 use super::pake::{PakeState, Role, PAKE_MSG_LEN};
@@ -40,7 +41,13 @@ pub struct HostSession {
     mode: HelloMode,
     /// The guest's authenticated `NodeId`, learned from `Hello`'s connection.
     guest_id: Option<NodeId>,
-    code: Code,
+    /// The code this session belongs to. `None` in ticket mode, which carries no
+    /// code and no nameplate (§5.4, last paragraph).
+    code: Option<Code>,
+    /// The SPAKE2 password: the code's words, or the ticket's 128-bit secret.
+    password: SecretString,
+    /// The nameplate a `Hello` must carry. `None` in ticket mode.
+    nameplate: Option<u16>,
     phase: PairingPhase,
     failures: u32,
     created: Instant,
@@ -69,8 +76,40 @@ impl fmt::Debug for HostSession {
 impl HostSession {
     /// Create a session for `code`, owned by `host_id`, in the given mode.
     pub fn new(host_id: NodeId, mode: HelloMode, code: Code, now: Instant) -> Result<Self> {
+        let password = code.password();
+        let nameplate = code.nameplate().get();
+        Self::build(host_id, mode, Some(code), password, Some(nameplate), now)
+    }
+
+    /// Create a session for a ticket, which carries a password but no code and no
+    /// nameplate (§5.4, last paragraph: "Mode tiket memakai langkah yang sama,
+    /// tanpa nameplate").
+    ///
+    /// The caller is responsible for the ticket secret's provenance; this type
+    /// never logs it and zeroizes its own copy on drop.
+    pub fn new_with_password(
+        host_id: NodeId,
+        mode: HelloMode,
+        password: &SecretString,
+        now: Instant,
+    ) -> Result<Self> {
+        Self::build(host_id, mode, None, password.duplicate(), None, now)
+    }
+
+    fn build(
+        host_id: NodeId,
+        mode: HelloMode,
+        code: Option<Code>,
+        password: SecretString,
+        nameplate: Option<u16>,
+        now: Instant,
+    ) -> Result<Self> {
         if !mode.uses_pake() {
             // Trusted mode has no code and no PAKE (§5.6).
+            return Err(PairingError::NotAllowed.into());
+        }
+        if code.is_some() != nameplate.is_some() {
+            // A code always carries a nameplate, and ticket mode carries neither.
             return Err(PairingError::NotAllowed.into());
         }
         Ok(Self {
@@ -78,6 +117,8 @@ impl HostSession {
             mode,
             guest_id: None,
             code,
+            password,
+            nameplate,
             phase: PairingPhase::WaitingForGuest,
             failures: 0,
             created: now,
@@ -99,10 +140,10 @@ impl HostSession {
         PAIRING_ATTEMPTS_MAX.saturating_sub(self.failures)
     }
 
-    /// The code this session is paired with. Callers that print it must go through
-    /// [`Code::reveal_for_user`]; nothing here prints it.
-    pub fn code(&self) -> &Code {
-        &self.code
+    /// The code this session is paired with, if any. Callers that print it must go
+    /// through [`Code::reveal_for_user`]; nothing here prints it.
+    pub fn code(&self) -> Option<&Code> {
+        self.code.as_ref()
     }
 
     pub fn mode(&self) -> HelloMode {
@@ -178,13 +219,18 @@ impl HostSession {
                 if hello_mode != self.mode {
                     return Ok(self.reject(Outcome::ProtocolViolation));
                 }
-                if let Some(plate) = hello_nameplate {
-                    if plate != self.code.nameplate().get() {
-                        // A wrong nameplate is not a guess: it is a misdial or a
-                        // probe, and must not spend an attempt.
+                if let Some(plate) = self.nameplate {
+                    if let Some(hello_plate) = hello_nameplate {
+                        if hello_plate != plate {
+                            // A wrong nameplate is not a guess: it is a misdial or a
+                            // probe, and must not spend an attempt.
+                            return Ok(self.reject(Outcome::ProtocolViolation));
+                        }
+                    } else if self.mode != HelloMode::OneShot && self.mode != HelloMode::Pair {
                         return Ok(self.reject(Outcome::ProtocolViolation));
                     }
-                } else if self.mode != HelloMode::OneShot && self.mode != HelloMode::Pair {
+                } else if hello_nameplate.is_some() {
+                    // Ticket mode has no nameplate to compare against.
                     return Ok(self.reject(Outcome::ProtocolViolation));
                 }
                 if let Some(expiry) = self.expire(now) {
@@ -200,9 +246,8 @@ impl HostSession {
                 self.phase = PairingPhase::Pairing;
                 self.deadline = Some(now + HANDSHAKE_TIMEOUT);
 
-                let password = self.code.password();
-                let (state, ours) = PakeState::start(Role::Host, &password, from, self.host_id);
-                drop(password);
+                let password = &self.password;
+                let (state, ours) = PakeState::start(Role::Host, password, from, self.host_id);
                 self.our_pake_msg = ours.clone();
                 self.pake = Some(state);
                 Ok(Step::Reply(ControlMsg::PakeMsg { payload: ours }))

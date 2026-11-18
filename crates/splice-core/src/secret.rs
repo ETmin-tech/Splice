@@ -50,6 +50,17 @@ impl<T: Zeroize> Secret<T> {
     }
 }
 
+impl<T: Zeroize + Clone> Secret<T> {
+    /// A second owned copy of the same secret.
+    ///
+    /// `Secret` deliberately does not implement `Clone`: a silent copy of a secret
+    /// is easy to leak. This named method makes each copy a visible decision, and
+    /// the copy zeroizes on its own drop like any other.
+    pub fn duplicate(&self) -> Self {
+        Self::new(self.inner.clone())
+    }
+}
+
 /// `Secret<String>` is the passphrase type used by the code/PAKE path.
 pub type SecretString = Secret<String>;
 

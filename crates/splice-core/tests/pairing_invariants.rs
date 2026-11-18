@@ -1200,3 +1200,163 @@ async fn pairing_completes_over_the_in_memory_transport() {
         ControlMsg::Pong
     );
 }
+
+// ---------------------------------------------------------------------------
+// Ticket mode — the same exchange, no code and no nameplate (§5.4 last line)
+// ---------------------------------------------------------------------------
+
+/// A host and a guest built from a ticket's secret must pair, and the `Hello` must
+/// carry no nameplate. This is the path `splice dev host-ticket/guest-ticket` use.
+#[test]
+fn a_ticket_secret_pairs_without_a_nameplate() {
+    use splice_core::discovery::Ticket;
+
+    let (guest_id, host_id) = ids();
+    let now = Instant::now();
+    // The host mints a ticket for itself; the guest holds only the encoded string.
+    let addr = splice_core::net::NodeAddr::new(host_id).with_ip("127.0.0.1:7000".parse().unwrap());
+    let ticket = Ticket::generate(&addr).expect("ticket");
+    let text = ticket.encode();
+    let parsed = Ticket::parse(text.expose_secret()).expect("parsed ticket");
+    assert_eq!(parsed.node(), host_id);
+
+    let host_password = ticket.password_string();
+    let guest_password = parsed.password_string();
+    let mut host = HostSession::new_with_password(host_id, HelloMode::Pair, &host_password, now)
+        .expect("host session");
+    let (mut guest, opening) =
+        GuestSession::begin_with_password(guest_id, host_id, HelloMode::Pair, &guest_password, now)
+            .expect("guest session");
+    assert_eq!(host.code(), None, "ticket mode carries no code");
+
+    // The guest's opening `Hello` must have no nameplate, or the host would refuse
+    // it as a probe (see `HostSession::on_message`).
+    match &opening[0] {
+        ControlMsg::Hello {
+            nameplate, mode, ..
+        } => {
+            assert_eq!(*nameplate, None);
+            assert_eq!(*mode, HelloMode::Pair);
+        }
+        other => panic!("expected Hello, got {}", other.name()),
+    }
+
+    let announcement = {
+        let host_share = expect_reply(
+            host.on_message(guest_id, opening[0].clone(), now)
+                .expect("hello"),
+        );
+        let host_mac = expect_reply(
+            host.on_message(guest_id, opening[1].clone(), now)
+                .expect("guest share"),
+        );
+        let guest_mac = expect_reply(
+            guest
+                .on_message(host_id, host_share, now)
+                .expect("host share"),
+        );
+        assert_eq!(
+            guest.on_message(host_id, host_mac, now).expect("host mac"),
+            Step::Idle
+        );
+        expect_reply(
+            host.on_message(guest_id, guest_mac, now)
+                .expect("guest mac"),
+        )
+    };
+
+    assert_eq!(host.phase(), PairingPhase::Paired);
+    assert_eq!(guest.phase(), PairingPhase::Paired);
+    assert!(matches!(announcement, ControlMsg::Paired { .. }));
+    assert_eq!(
+        host.session_key().expect("host key").expose_secret(),
+        guest.session_key().expect("guest key").expose_secret(),
+        "both sides must derive the same ticket key"
+    );
+}
+
+/// A ticket-mode host must refuse a `Hello` that carries a nameplate: the ticket
+/// names no code, so a plate is either a misdial or a probe, and spending an
+/// attempt on it would let a stranger burn the ticket.
+#[test]
+fn a_ticket_host_refuses_a_nameplate_without_spending_an_attempt() {
+    use splice_core::discovery::Ticket;
+
+    let (_guest_id, host_id) = ids();
+    let now = Instant::now();
+    let addr = splice_core::net::NodeAddr::new(host_id);
+    let ticket = Ticket::generate(&addr).expect("ticket");
+    let password = ticket.password_string();
+    let mut host =
+        HostSession::new_with_password(host_id, HelloMode::Pair, &password, now).expect("host");
+
+    let probe = NodeId::from_bytes([0x33; 32]);
+    let step = host
+        .on_message(
+            probe,
+            ControlMsg::Hello {
+                version: splice_core::constants::PROTOCOL_VERSION,
+                mode: HelloMode::Pair,
+                nameplate: Some(42),
+                resume: None,
+            },
+            now,
+        )
+        .expect("hello");
+    assert!(matches!(
+        step,
+        Step::ReplyThenClose {
+            outcome: Outcome::ProtocolViolation,
+            ..
+        }
+    ));
+    assert_eq!(host.attempts_left(), PAIRING_ATTEMPTS_MAX);
+}
+
+/// A wrong ticket secret is a wrong password: the host spends an attempt, exactly
+/// like a wrong code, so ticket mode is not a guessing oracle.
+#[test]
+fn a_wrong_ticket_secret_spends_an_attempt() {
+    use splice_core::discovery::Ticket;
+
+    let (guest_id, host_id) = ids();
+    let now = Instant::now();
+    let host_ticket = Ticket::from_parts(host_id, Vec::new(), None, &[1u8; 16]);
+    let guest_ticket = Ticket::from_parts(host_id, Vec::new(), None, &[2u8; 16]);
+    let mut host = HostSession::new_with_password(
+        host_id,
+        HelloMode::Pair,
+        &host_ticket.password_string(),
+        now,
+    )
+    .expect("host");
+    let (guest, opening) = GuestSession::begin_with_password(
+        guest_id,
+        host_id,
+        HelloMode::Pair,
+        &guest_ticket.password_string(),
+        now,
+    )
+    .expect("guest");
+    let _ = guest;
+
+    expect_reply(
+        host.on_message(guest_id, opening[0].clone(), now)
+            .expect("hello"),
+    );
+    expect_reply(
+        host.on_message(guest_id, opening[1].clone(), now)
+            .expect("share"),
+    );
+    let step = host
+        .on_message(guest_id, ControlMsg::PakeConfirm { mac: [0u8; 32] }, now)
+        .expect("confirm");
+    assert!(matches!(
+        step,
+        Step::ReplyThenClose {
+            outcome: Outcome::Failed,
+            ..
+        }
+    ));
+    assert_eq!(host.attempts_left(), PAIRING_ATTEMPTS_MAX - 1);
+}

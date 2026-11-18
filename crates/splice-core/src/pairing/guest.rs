@@ -27,7 +27,7 @@ use crate::constants::HANDSHAKE_TIMEOUT;
 use crate::error::{PairingError, Result};
 use crate::identity::NodeId;
 use crate::proto::messages::{ByeReason, ControlMsg, HelloMode};
-use crate::secret::Secret;
+use crate::secret::{Secret, SecretString};
 
 use super::confirm::{confirm_mac, verify_mac, Transcript};
 use super::pake::{PakeState, Role, PAKE_MSG_LEN};
@@ -42,7 +42,8 @@ pub struct GuestSession {
     /// `NodeId` cannot complete the exchange.
     host_id: NodeId,
     mode: HelloMode,
-    code: Code,
+    /// The code this session belongs to. `None` in ticket mode.
+    code: Option<Code>,
     phase: PairingPhase,
     pake: Option<PakeState>,
     our_pake_msg: Vec<u8>,
@@ -76,18 +77,62 @@ impl GuestSession {
         code: Code,
         now: Instant,
     ) -> Result<(Self, Vec<ControlMsg>)> {
+        let password = code.password();
+        let nameplate = code.nameplate().get();
+        Self::build(
+            self_id,
+            host_id,
+            mode,
+            Some(code),
+            password,
+            Some(nameplate),
+            now,
+        )
+    }
+
+    /// Start a pairing for a ticket: same exchange, no nameplate, and the ticket's
+    /// 128-bit secret as the SPAKE2 password (§5.4, last paragraph).
+    pub fn begin_with_password(
+        self_id: NodeId,
+        host_id: NodeId,
+        mode: HelloMode,
+        password: &SecretString,
+        now: Instant,
+    ) -> Result<(Self, Vec<ControlMsg>)> {
+        Self::build(
+            self_id,
+            host_id,
+            mode,
+            None,
+            password.duplicate(),
+            None,
+            now,
+        )
+    }
+
+    fn build(
+        self_id: NodeId,
+        host_id: NodeId,
+        mode: HelloMode,
+        code: Option<Code>,
+        password: SecretString,
+        nameplate: Option<u16>,
+        now: Instant,
+    ) -> Result<(Self, Vec<ControlMsg>)> {
         if !mode.uses_pake() {
             // Trusted mode has no PAKE and no code (§5.6); it is not a pairing.
             return Err(PairingError::NotAllowed.into());
         }
-        let password = code.password();
+        if code.is_some() != nameplate.is_some() {
+            // A code always carries a nameplate, and ticket mode carries neither.
+            return Err(PairingError::NotAllowed.into());
+        }
         let (pake, our_msg) = PakeState::start(Role::Guest, &password, self_id, host_id);
-        drop(password);
 
         let hello = ControlMsg::Hello {
             version: crate::constants::PROTOCOL_VERSION,
             mode,
-            nameplate: Some(code.nameplate().get()),
+            nameplate,
             resume: None,
         };
         let session = Self {
@@ -121,10 +166,11 @@ impl GuestSession {
         self.host_id
     }
 
-    /// The code, for printing through [`Code::reveal_for_user`] (one-shot) or not at
-    /// all (after pairing). Nothing here prints it.
-    pub fn code(&self) -> &Code {
-        &self.code
+    /// The code this session is paired with, if any. For printing through
+    /// [`Code::reveal_for_user`] (one-shot) or not at all (after pairing). Nothing
+    /// here prints it.
+    pub fn code(&self) -> Option<&Code> {
+        self.code.as_ref()
     }
 
     pub fn deadline(&self) -> Option<Instant> {
@@ -480,7 +526,12 @@ mod tests {
     fn debug_never_prints_the_words() {
         let (s, _) = guest();
         let text = format!("{s:?}");
-        let words = s.code().password().expose_secret().clone();
+        let words = s
+            .code()
+            .expect("code mode")
+            .password()
+            .expose_secret()
+            .clone();
         for word in words.split('-') {
             assert!(!text.contains(word), "Debug leaked a word");
         }

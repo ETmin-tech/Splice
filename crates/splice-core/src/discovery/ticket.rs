@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{DiscoveryError, Result};
 use crate::identity::NodeId;
 use crate::net::NodeAddr;
-use crate::secret::SecretBytes;
+use crate::secret::{SecretBytes, SecretString};
 
 /// Visible prefix. Ends with `-` so the body is easy to delimit by eye.
 pub const TICKET_PREFIX: &str = "sp1-";
@@ -116,6 +116,22 @@ impl Ticket {
         SecretBytes::from_slice(self.secret.expose_secret())
     }
 
+    /// The SPAKE2 password in the form the pairing machines take.
+    ///
+    /// The ticket secret is 128 random bits, not text, so it cannot be handed over
+    /// as a `SecretString` losslessly by copying bytes. Encoding it as lowercase hex
+    /// keeps every bit and keeps it printable, and the same encoding on both sides
+    /// yields the same password (§5.4, last paragraph).
+    pub fn password_string(&self) -> SecretString {
+        use std::fmt::Write as _;
+
+        let mut text = String::with_capacity(TICKET_SECRET_LEN * 2);
+        for byte in self.secret.expose_secret() {
+            let _ = write!(&mut text, "{byte:02x}");
+        }
+        SecretString::from_string(text)
+    }
+
     /// The dial target this ticket describes.
     pub fn to_node_addr(&self) -> NodeAddr {
         let mut addr = NodeAddr::new(self.node);
@@ -204,8 +220,6 @@ impl FromStr for Ticket {
     }
 }
 
-use crate::secret::SecretString;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,15 +237,41 @@ mod tests {
     #[test]
     fn roundtrip_preserves_everything() {
         let ticket = sample();
-        let encoded = ticket.encode();
-        let text = encoded.expose_secret().clone();
-        let parsed = Ticket::parse(&text).unwrap();
+        let text = ticket.encode();
+        let raw = text.expose_secret().clone();
+        let parsed = Ticket::parse(&raw).unwrap();
         assert_eq!(parsed.node(), ticket.node());
         assert_eq!(parsed.direct(), ticket.direct());
         assert_eq!(parsed.relay(), None);
         assert_eq!(
             parsed.password().expose_secret(),
             ticket.password().expose_secret()
+        );
+    }
+
+    /// The ticket secret is random bytes, so the pairing machines cannot take it as
+    /// text directly. `password_string` keeps every bit, and two tickets with the
+    /// same secret must produce the same password on both sides.
+    #[test]
+    fn password_string_is_lossless_and_stable() {
+        let ticket = sample();
+        let text = ticket.encode();
+        let raw = text.expose_secret().clone();
+        let parsed = Ticket::parse(&raw).unwrap();
+        assert_eq!(
+            parsed.password_string().expose_secret(),
+            ticket.password_string().expose_secret()
+        );
+        // 16 bytes as lowercase hex: 32 characters, all in `[0-9a-f]`.
+        let password = ticket.password_string();
+        let value = password.expose_secret();
+        assert_eq!(value.len(), TICKET_SECRET_LEN * 2);
+        assert!(value
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            value.contains("5a5a"),
+            "the sample secret is all 0x5a bytes"
         );
     }
 
