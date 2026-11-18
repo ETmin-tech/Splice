@@ -86,7 +86,7 @@ pub async fn run() -> Result<()> {
     emit(serde_json::json!({
         "event": "alpn_positive",
         "connect_ms": connect_ms,
-        "negotiated_alpn": String::from_utf8_lossy(&negotiated).to_string(),
+        "negotiated_alpn": String::from_utf8_lossy(negotiated).to_string(),
         "alpn_is_splice_1": negotiated == ALPN,
         "stream_type_roundtrip": ty,
         "type_byte_preserved": ty == STREAM_TYPE_CONTROL,

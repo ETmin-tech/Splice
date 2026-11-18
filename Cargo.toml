@@ -32,6 +32,23 @@ clap = { version = "4", features = ["derive"] }
 data-encoding = "2"
 if-addrs = "0.15"
 subtle = "2"
+spake2 = "0.4"
+
+# SPAKE2's group arithmetic is elliptic-curve code: at `opt-level = 0` a single
+# `finish()` takes long enough that the 10 000-guess invariant test never
+# terminates. The test profile inherits `dev`, so these few dependencies are
+# optimised while the workspace crates stay debuggable.
+[profile.dev.package.spake2]
+opt-level = 3
+
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.hmac]
+opt-level = 3
 
 [profile.release]
 lto = "fat"

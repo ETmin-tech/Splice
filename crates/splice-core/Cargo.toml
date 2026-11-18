@@ -25,6 +25,7 @@ socket2.workspace = true
 data-encoding.workspace = true
 if-addrs.workspace = true
 subtle.workspace = true
+spake2.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
