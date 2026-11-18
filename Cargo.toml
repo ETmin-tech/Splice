@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = ["crates/splice-core", "crates/splice", "spikes/iroh-offline"]
+# `fuzz/` is a separate workspace: cargo-fuzz needs the nightly `-Z sanitizer` flags and
+# a `libfuzzer-sys` dependency that must not leak into the main build graph.
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/splice"
+
+[workspace.dependencies]
+iroh = "1.4.1"
+tokio = { version = "1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+blake3 = "1"
+spake2 = "0.4.0"
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.9"
+getrandom = "0.3"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "7"
+mdns-sd = "0.22"
+socket2 = { version = "0.6", features = ["all"] }
+clap = { version = "4", features = ["derive"] }
+data-encoding = "2"
+serde_json = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+opt-level = 3
+panic = "unwind" # so `Drop` guards (terminal restore) always run

@@ -1,0 +1,15 @@
+# Build output
+/target/
+/spikes/iroh-offline/target/
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
+
+# Tool artifacts
+/graphify-out/
+
+# Local config and secrets that must never be committed
+*.key
+identity.key
+devices.json
+.env
