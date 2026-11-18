@@ -3345,6 +3345,7 @@ dependencies = [
  "proptest",
  "rand 0.9.5",
  "serde",
+ "serde_json",
  "socket2",
  "spake2",
  "subtle",

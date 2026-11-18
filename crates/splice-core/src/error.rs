@@ -184,6 +184,25 @@ pub enum TrustError {
         detail: String,
         backup: PathBuf,
     },
+    #[error(
+        "trust store {path} is corrupt: {detail}, and the backup could not be written: {source}"
+    )]
+    BackupFailed {
+        path: PathBuf,
+        detail: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "trust store {path} uses format version {version}; this build supports up to {supported}"
+    )]
+    UnsupportedVersion {
+        path: PathBuf,
+        version: u8,
+        supported: u8,
+    },
+    #[error("trust store {path} has insecure permissions {mode:o}; expected owner-only (0600)")]
+    InsecurePermissions { path: PathBuf, mode: u32 },
     #[error("trust store {path} could not be saved: {source}")]
     Save {
         path: PathBuf,

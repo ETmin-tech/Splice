@@ -32,6 +32,9 @@ struct Arrival {
     from: NodeId,
     alpn: Vec<u8>,
     pipe: DuplexStream,
+    /// Shared by both ends: a connection is one object, so a close by either
+    /// side is visible to both, exactly like a real QUIC connection close.
+    closed: Arc<Flag>,
 }
 
 /// A one-way "closed" broadcast. `watch` is used rather than a bare `Notify`
@@ -158,13 +161,17 @@ impl Transport for MemoryTransport {
                 .cloned()
                 .ok_or_else(|| NetError::Dial("unknown node".to_string()))?;
 
-            // `duplex` hands back the two ends of one bidirectional pipe.
+            // `duplex` hands back the two ends of one bidirectional pipe. The
+            // close flag is shared so a hang-up on either side is observed by
+            // both, which is what `Connection::closed` promises.
             let (dialer_pipe, acceptor_pipe) = duplex(256 * 1024);
+            let closed = Arc::new(Flag::new());
             sender
                 .try_send(Arrival {
                     from,
                     alpn: alpn.clone(),
                     pipe: acceptor_pipe,
+                    closed: closed.clone(),
                 })
                 .map_err(|_| NetError::Dial("peer is not accepting".to_string()))?;
 
@@ -173,7 +180,7 @@ impl Transport for MemoryTransport {
                 relay,
                 alpn,
                 pipe: Mutex::new(Some(dialer_pipe)),
-                closed: Flag::new(),
+                closed,
             }) as Arc<dyn Connection>)
         })
     }
@@ -207,14 +214,18 @@ impl Transport for MemoryTransport {
 
             match received {
                 None => Ok(None),
-                Some(Arrival { from, alpn, pipe }) => Ok(Some(Arc::new(End {
+                Some(Arrival {
+                    from,
+                    alpn,
+                    pipe,
+                    closed,
+                }) => Ok(Some(Arc::new(End {
                     peer: from,
                     relay,
                     alpn,
                     pipe: Mutex::new(Some(pipe)),
-                    closed: Flag::new(),
-                })
-                    as Arc<dyn Connection>)),
+                    closed,
+                }) as Arc<dyn Connection>)),
             }
         })
     }
@@ -233,7 +244,7 @@ struct End {
     alpn: Vec<u8>,
     /// Both ends start with their own half of the pipe and hand it out exactly once.
     pipe: Mutex<Option<DuplexStream>>,
-    closed: Flag,
+    closed: Arc<Flag>,
 }
 
 impl End {
@@ -350,6 +361,25 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(50), dial.closed())
             .await
             .expect("closed() should resolve immediately");
+    }
+
+    #[tokio::test]
+    async fn closing_one_end_is_observed_by_the_other() {
+        // A real connection is one object: a close by either peer hangs up both.
+        let net = Network::new();
+        let a = net.endpoint(false);
+        let b = net.endpoint(false);
+        let dial = a.connect(b.hint(), crate::constants::ALPN).await.unwrap();
+        let accepted = b.accept().await.unwrap().expect("connection");
+
+        accepted.close(0, b"bye");
+
+        tokio::time::timeout(Duration::from_millis(50), dial.closed())
+            .await
+            .expect("the dialer must see the acceptor's close");
+        tokio::time::timeout(Duration::from_millis(50), accepted.closed())
+            .await
+            .expect("and the closer is closed too");
     }
 
     #[tokio::test]

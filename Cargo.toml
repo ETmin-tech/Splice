@@ -16,6 +16,7 @@ repository = "https://example.invalid/splice"
 iroh = "1.4.1"
 tokio = { version = "1", default-features = false }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 postcard = { version = "1", features = ["use-std"] }
 blake3 = "1"
 zeroize = { version = "1", features = ["derive"] }

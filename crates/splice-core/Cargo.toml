@@ -12,6 +12,7 @@ publish = false
 iroh.workspace = true
 tokio = { workspace = true, features = ["net", "sync", "time", "macros"] }
 serde.workspace = true
+serde_json.workspace = true
 postcard.workspace = true
 blake3.workspace = true
 zeroize.workspace = true
