@@ -48,6 +48,7 @@ pub async fn run(cli: &Cli, cmd: &DevCommand) -> Result<()> {
         DevCommand::HostTicket => host_ticket(cli).await,
         DevCommand::GuestTicket { ticket } => guest_ticket(cli, ticket).await,
         DevCommand::Ping { alias } => ping(cli, alias).await,
+        DevCommand::Presence { alias } => presence(alias).await,
     }
 }
 
@@ -388,9 +389,73 @@ async fn ping(cli: &Cli, alias: &str) -> Result<()> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Small helpers
-// ---------------------------------------------------------------------------
+/// Watch one trusted device, printing each online/offline transition.
+///
+/// This is the observer Step 12 measures: it runs the same [`PresenceTracker`]
+/// that `listen` and the future daemon use, so the latency it reports is the
+/// product's discovery latency and not a benchmark-only code path.
+///
+/// Output is one line per transition, with a monotonic timestamp the harness can
+/// subtract from its own:
+///   `PRESENCE online <alias> <node_id> <ms>`
+///   `PRESENCE offline <alias> <node_id> <ms>`
+/// where `<ms>` is milliseconds since this process started, taken *before* the
+/// line is printed so printing cost never lands inside the measurement.
+async fn presence(alias: &str) -> Result<()> {
+    let started = Instant::now();
+    let store = TrustStore::load()?;
+    let entry = store
+        .find_by_alias(alias)
+        .ok_or_else(|| anyhow!("alias `{alias}` tidak ada di daftar tepercaya"))?;
+    let target = entry.node_id;
+
+    // Only the one device: the tracker matches only trusted ids, and watching the
+    // whole store would make a transition ambiguous for a single-alias watcher.
+    let socket = PresenceSocket::bind(PRESENCE_PORT)
+        .map_err(|e| anyhow!("gagal membuka soket presence: {e}"))?;
+    let mut tracker = PresenceTracker::new(Arc::new(SystemClock));
+    tracker.set_trusted(vec![target]);
+
+    println!("PRESENCE watching {alias} {target}");
+    let mut was_online = false;
+
+    // Poll faster than the beacon interval: the beacon itself is emitted every
+    // PRESENCE_INTERVAL, and a slower poll would add its own quantisation to the
+    // number under test.
+    let mut poll = tokio::time::interval(Duration::from_millis(100));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = poll.tick() => {
+                let online = tracker.is_online(target);
+                if online != was_online {
+                    println!("{}", presence_line(online, alias, target, started.elapsed().as_millis()));
+                    was_online = online;
+                }
+            }
+            datagram = socket.recv() => {
+                match datagram {
+                    Ok((buffer, len, from)) => {
+                        tracker.observe(&buffer[..len.min(buffer.len())], from);
+                    }
+                    Err(err) => return Err(anyhow!("presence: {err}")),
+                }
+            }
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+        }
+    }
+}
+
+/// One transition line. Kept pure so its format is testable: the Step 12
+/// harness parses these lines, and a silent format change would turn a
+/// measurement into a hang rather than a failure.
+fn presence_line(online: bool, alias: &str, node: NodeId, elapsed_ms: u128) -> String {
+    format!(
+        "PRESENCE {} {alias} {node} {elapsed_ms}",
+        if online { "online" } else { "offline" }
+    )
+}
 
 /// Build an endpoint on a fresh ephemeral identity, per the dev commands' promise
 /// that they touch nothing on disk.
@@ -483,4 +548,98 @@ async fn presence_hint(target: NodeId) -> Result<NodeAddr> {
     Err(anyhow!(
         "perangkat tidak terlihat di LAN; jalankan `splice listen` di sana atau pakai --addr nodeid@ip:port"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use splice_core::clock::ManualClock;
+    use std::time::Duration as StdDuration;
+
+    fn id(seed: u8) -> NodeId {
+        let mut bytes = [0u8; 32];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = seed.wrapping_add(i as u8);
+        }
+        NodeId::from_bytes(bytes)
+    }
+
+    /// The harness parses this line by splitting on spaces, so the field order and
+    /// the two literals are load-bearing.
+    #[test]
+    fn a_transition_line_has_the_shape_the_harness_parses() {
+        let node = id(0x11);
+        let line = presence_line(true, "dapur", node, 1234);
+        let fields: Vec<&str> = line.split(' ').collect();
+        assert_eq!(fields.len(), 5, "unexpected line: {line}");
+        assert_eq!(fields[0], "PRESENCE");
+        assert_eq!(fields[1], "online");
+        assert_eq!(fields[2], "dapur");
+        assert_eq!(fields[3], node.to_string());
+        assert_eq!(fields[4], "1234");
+
+        let going_off = presence_line(false, "dapur", node, 99);
+        assert!(going_off.starts_with("PRESENCE offline "));
+    }
+
+    /// The observer's two transitions come from the tracker, not from a timer of
+    /// its own: a beacon makes it online, and silence past
+    /// `PRESENCE_OFFLINE_AFTER` makes it offline again.
+    #[test]
+    fn a_watched_device_goes_online_on_a_beacon_and_offline_when_it_stops() {
+        use splice_core::discovery::presence::{bucket_at, tag_for, Beacon};
+
+        let now = StdDuration::from_secs(1_700_000_000);
+        let clock = Arc::new(ManualClock::at(now));
+        let target = id(0x22);
+
+        let mut tracker = PresenceTracker::new(clock.clone());
+        tracker.set_trusted(vec![target]);
+        assert!(!tracker.is_online(target), "nothing heard yet");
+
+        let beacon = Beacon {
+            tag: tag_for(target, bucket_at(now)),
+            port: 4242,
+        };
+        let from = "10.200.0.2:47820".parse().expect("addr");
+        let matched = tracker
+            .observe(&beacon.encode(), from)
+            .expect("the beacon must match the watched device");
+        assert_eq!(matched.node, target);
+        assert!(tracker.is_online(target), "a beacon makes it online");
+
+        // Just inside the window it is still online; past it, offline.
+        clock.set(
+            now + splice_core::constants::PRESENCE_OFFLINE_AFTER - StdDuration::from_millis(1),
+        );
+        assert!(tracker.is_online(target));
+        clock.set(now + splice_core::constants::PRESENCE_OFFLINE_AFTER);
+        assert!(
+            !tracker.is_online(target),
+            "silence past PRESENCE_OFFLINE_AFTER must read as offline"
+        );
+    }
+
+    /// A beacon from an untrusted device must not produce a transition: the
+    /// watcher is given exactly one id, and matching is by key.
+    #[test]
+    fn a_beacon_from_another_device_does_not_flip_the_watched_one() {
+        use splice_core::discovery::presence::{bucket_at, tag_for, Beacon};
+
+        let now = StdDuration::from_secs(1_700_000_000);
+        let clock = Arc::new(ManualClock::at(now));
+        let target = id(0x33);
+        let stranger = id(0x44);
+
+        let mut tracker = PresenceTracker::new(clock);
+        tracker.set_trusted(vec![target]);
+
+        let beacon = Beacon {
+            tag: tag_for(stranger, bucket_at(now)),
+            port: 4242,
+        };
+        let from = "10.200.0.2:47820".parse().expect("addr");
+        assert!(tracker.observe(&beacon.encode(), from).is_none());
+        assert!(!tracker.is_online(target));
+    }
 }

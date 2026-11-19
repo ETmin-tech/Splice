@@ -112,6 +112,13 @@ pub enum DevCommand {
     GuestTicket { ticket: String },
     /// Ping a trusted device by alias.
     Ping { alias: String },
+    /// Watch one trusted device and print each online/offline transition.
+    ///
+    /// Phase 1 has no daemon and `splice devices` shows only the trust store, so
+    /// there is no live "device list" to time. This runs the same
+    /// `PresenceTracker` the daemon will use and prints the transitions, which
+    /// makes the Step 12 discovery latency measurable without inventing UI.
+    Presence { alias: String },
 }
 
 // ---------------------------------------------------------------------------
