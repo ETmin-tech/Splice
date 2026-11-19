@@ -207,7 +207,11 @@ async fn serve_guest(
 
     // Trust exchange (§5.4 step 9). A verified MAC is not consent (I18): the entry
     // is stored only if both humans say yes.
-    let our_alias = sanitize_alias(&format!("device-{}", peer.prefix8()))?;
+    //
+    // `TrustExchange` carries the sender's *own* display name; the receiver stores
+    // it as the alias for the sender. So each side stores the name the peer chose
+    // for itself, and the prompt it shows names the peer, not the local device.
+    let our_alias = exchange_alias(node_id)?;
     write_control(&mut tx, &ControlMsg::TrustExchange { alias: our_alias }).await?;
 
     let their_msg = timeout(READ_TIMEOUT, read_control(&mut rx))
@@ -240,12 +244,7 @@ async fn serve_guest(
         .map_err(|_| anyhow!("batas waktu menunggu TrustAck"))??;
     match ack {
         ControlMsg::TrustAck => {
-            trust_store.add(TrustEntry::new(
-                peer,
-                consent.alias.clone(),
-                SystemClock.now(),
-            ))?;
-            trust_store.save()?;
+            record_peer(trust_store, peer, &consent, SystemClock.now())?;
             println!("✅ {} tersimpan", consent.alias);
             info!(%node_id, %peer, alias=%consent.alias, "perangkat tepercaya ditambahkan");
         }
@@ -253,6 +252,28 @@ async fn serve_guest(
     }
 
     Ok(Some(()))
+}
+
+/// The name this device offers to its peer.
+///
+/// `TrustExchange` carries the sender's **own** name, so this is built from our
+/// `NodeId`. Building it from the peer's id instead makes each side store its own
+/// name under the peer's id, which is why this lives in one place with a test.
+fn exchange_alias(our_id: NodeId) -> Result<String> {
+    Ok(sanitize_alias(&format!("device-{}", our_id.prefix8()))?)
+}
+
+/// Record the peer after both humans agreed: the peer's `NodeId` under the name the
+/// peer chose for itself (the alias we received, not the one we sent).
+fn record_peer(
+    store: &mut TrustStore,
+    peer: NodeId,
+    consent: &splice_core::pairing::AliasConsent,
+    now: Duration,
+) -> Result<()> {
+    store.add(TrustEntry::new(peer, consent.alias.clone(), now))?;
+    store.save()?;
+    Ok(())
 }
 
 /// Close a pairing politely: send `Bye`, then wait for the guest to hang up so the
@@ -346,7 +367,8 @@ async fn join(cli: &Cli, code_str: Option<&str>) -> Result<()> {
         other => anyhow::bail!("diharapkan Paired, dapat: {:?}", other.name()),
     }
 
-    // Trust exchange: host proposes our alias first.
+    // Trust exchange: each side sends the name it wants to be called by, then
+    // stores the name it receives as the peer's alias (see the host comment).
     let host_msg = timeout(READ_TIMEOUT, read_control(&mut rx))
         .await
         .map_err(|_| anyhow!("batas waktu menunggu TrustExchange host"))??;
@@ -355,14 +377,8 @@ async fn join(cli: &Cli, code_str: Option<&str>) -> Result<()> {
         other => anyhow::bail!("diharapkan TrustExchange, dapat: {:?}", other.name()),
     };
 
-    let our_alias = sanitize_alias(&format!("device-{}", peer.prefix8()))?;
-    write_control(
-        &mut tx,
-        &ControlMsg::TrustExchange {
-            alias: our_alias.clone(),
-        },
-    )
-    .await?;
+    let our_alias = exchange_alias(node_id)?;
+    write_control(&mut tx, &ControlMsg::TrustExchange { alias: our_alias }).await?;
 
     let consent = consent_or_refuse(&host_alias, peer)?;
     if !make_prompter(cli).confirm(&consent) {
@@ -383,10 +399,8 @@ async fn join(cli: &Cli, code_str: Option<&str>) -> Result<()> {
         .map_err(|_| anyhow!("batas waktu menunggu TrustAck host"))??;
     match ack {
         ControlMsg::TrustAck => {
-            let mut trust_store = TrustStore::load()?;
-            trust_store.add(TrustEntry::new(peer, our_alias.clone(), SystemClock.now()))?;
-            trust_store.save()?;
-            println!("✅ {our_alias} tersimpan");
+            record_peer(&mut TrustStore::load()?, peer, &consent, SystemClock.now())?;
+            println!("✅ {} tersimpan", consent.alias);
         }
         other => warn!(msg=?other.name(), "diharapkan TrustAck"),
     }
@@ -415,4 +429,63 @@ async fn resolve_host(cli: &Cli, code: &Code) -> Result<NodeAddr> {
     }
 
     anyhow::bail!("tidak dapat menemukan host. Coba --addr nodeid@ip:port atau gunakan tiket")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use splice_core::pairing::AliasConsent;
+    use tempfile::TempDir;
+
+    fn id(seed: u8) -> NodeId {
+        // A patterned id, so `prefix8()` and `shorthand()` differ: a test that
+        // cannot tell them apart would not catch an alias built from the wrong end.
+        let mut bytes = [0u8; 32];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = seed.wrapping_add(i as u8);
+        }
+        NodeId::from_bytes(bytes)
+    }
+
+    /// `TrustExchange` names the *sender*. The name must come from our own id, so
+    /// the peer stores it against us and not against itself.
+    #[test]
+    fn the_offered_alias_names_this_device_not_the_peer() {
+        let ours = id(0xa1);
+        let peer = id(0xb2);
+
+        let offered = exchange_alias(ours).expect("alias");
+        assert_eq!(offered, format!("device-{}", ours.prefix8()));
+        assert_ne!(
+            offered,
+            format!("device-{}", peer.prefix8()),
+            "the alias we send must not be built from the peer's id"
+        );
+    }
+
+    /// The entry stored for the peer carries the name the peer sent, under the
+    /// peer's `NodeId` — the direction `splice devices` reads back.
+    #[test]
+    fn the_stored_entry_uses_the_alias_the_peer_sent() {
+        let dir = TempDir::new().expect("temp dir");
+        let mut store = TrustStore::load_in(dir.path()).expect("empty store");
+
+        let peer = id(0xc3);
+        // Not derivable from any NodeId, so a store that regenerates the name from
+        // an id (ours or the peer's) cannot pass by coincidence.
+        let their_alias = "dapur".to_string();
+        let consent = AliasConsent::new(&their_alias, peer).expect("consent");
+
+        record_peer(&mut store, peer, &consent, Duration::from_secs(1)).expect("record");
+
+        let saved = TrustStore::load_in(dir.path()).expect("reload");
+        let entry = saved.get(&peer).expect("the peer must be recorded");
+        assert_eq!(entry.alias, their_alias);
+
+        // The listing is by alias, so this is what a human sees.
+        let found = saved
+            .find_by_alias(&their_alias)
+            .expect("the peer is reachable by the name it chose");
+        assert_eq!(found.node_id, peer);
+    }
 }
