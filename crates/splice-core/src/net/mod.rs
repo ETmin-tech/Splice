@@ -201,8 +201,10 @@ pub trait Transport: Send + Sync {
     /// Our [`NodeId`]. Public key, safe to log.
     fn node_id(&self) -> NodeId;
 
-    /// Addresses we are listening on. Unspecified (`0.0.0.0`) entries are not
-    /// dialable and are filtered out by the caller that needs them.
+    /// Interface addresses this endpoint can be dialed on, with the port it is
+    /// listening on. Callers filter out unspecified and loopback; a real
+    /// implementation should therefore report the resolved interface addresses,
+    /// not the wildcard binds.
     fn local_addrs(&self) -> Vec<SocketAddr>;
 
     /// Dial a peer. Fails fast when the transport has no way to reach it.

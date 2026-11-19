@@ -78,7 +78,12 @@ impl Transport for IrohTransport {
     }
 
     fn local_addrs(&self) -> Vec<std::net::SocketAddr> {
-        self.endpoint.bound_sockets()
+        // `bound_sockets` only reports what the socket was bound to, which for the
+        // default configuration is `0.0.0.0:port` and `[::]:port`; the interface
+        // addresses are what iroh derives from those binds plus netmon. Callers
+        // need the latter (they filter out unspecified and loopback), otherwise a
+        // host on a LAN or in a network namespace has no dialable address at all.
+        self.endpoint.addr().ip_addrs().copied().collect()
     }
 
     fn connect(&self, addr: NodeAddr, alpn: &[u8]) -> BoxFuture<Result<Arc<dyn Connection>>> {
