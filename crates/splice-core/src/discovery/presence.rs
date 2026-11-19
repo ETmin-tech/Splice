@@ -395,13 +395,20 @@ impl PresenceSocket {
             })?;
 
         let group = PRESENCE_GROUP_V4;
-        let joined = join_on_all_interfaces(&socket, group);
-        if !joined {
+        let egress = join_on_all_interfaces(&socket, group);
+        let Some(egress) = egress else {
             return Err(DiscoveryError::MulticastUnavailable(format!(
                 "cannot join {group} on any IPv4 interface"
             ))
             .into());
-        }
+        };
+        // Joining only fixes the receive path. Sending without an explicit egress
+        // interface asks the kernel to pick one from the routing table, which
+        // fails with `Network is unreachable` when there is no default route (an
+        // offline network namespace, a client-isolated WLAN). Pin the egress to
+        // the interface we already joined on; a failure here is not fatal, because
+        // a host with a default route still works without it.
+        let _ = socket.set_multicast_if_v4(&egress);
         let socket = tokio::net::UdpSocket::from_std(socket.into())
             .map_err(|err| DiscoveryError::PresenceSocket(err.to_string()))?;
         Ok(Self { socket, group })
@@ -451,38 +458,41 @@ impl PresenceSocket {
     }
 }
 
-/// Best-effort join on every interface. Returns `true` if at least one worked.
+/// Best-effort join on every interface, returning the address to also use as the
+/// egress interface.
 ///
 /// `join_multicast_v4` with `Ipv4Addr::UNSPECIFIED` lets the kernel pick the
 /// interface for the default route, which is exactly what breaks on a
 /// client-isolated Wi-Fi or an offline network namespace; so we try each
 /// interface address explicitly and keep the successes.
-fn join_on_all_interfaces(socket: &socket2::Socket, group: Ipv4Addr) -> bool {
-    let mut any = false;
-    let Ok(interfaces) = if_addrs::get_if_addrs() else {
-        return false;
-    };
-    for interface in interfaces {
-        let IpAddr::V4(addr) = interface.ip() else {
-            continue;
-        };
-        if addr.is_loopback() || addr.is_link_local() {
-            // Loopback has no multicast, and link-local addresses are handled by
-            // the interface's normal address anyway.
-            continue;
-        }
-        if socket.join_multicast_v4(&group, &addr).is_ok() {
-            any = true;
+fn join_on_all_interfaces(socket: &socket2::Socket, group: Ipv4Addr) -> Option<Ipv4Addr> {
+    let mut egress = None;
+    if let Ok(interfaces) = if_addrs::get_if_addrs() {
+        for interface in interfaces {
+            let IpAddr::V4(addr) = interface.ip() else {
+                continue;
+            };
+            if addr.is_loopback() || addr.is_link_local() {
+                // Loopback has no multicast, and link-local addresses are handled by
+                // the interface's normal address anyway.
+                continue;
+            }
+            if socket.join_multicast_v4(&group, &addr).is_ok() && egress.is_none() {
+                egress = Some(addr);
+            }
         }
     }
-    if !any {
+    if egress.is_none() {
         // Fall back to the kernel's choice: works on a normal single-NIC host
         // even when enumeration is restricted.
-        any = socket
+        if socket
             .join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)
-            .is_ok();
+            .is_ok()
+        {
+            egress = Some(Ipv4Addr::UNSPECIFIED);
+        }
     }
-    any
+    egress
 }
 
 #[cfg(test)]
