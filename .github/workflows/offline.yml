@@ -1,0 +1,50 @@
+name: offline
+
+# Step 11: pairing and trusted discovery with no internet available.
+# The runner is the only thing that needs the network (checkout, rustup, cargo);
+# each splice process is confined to a namespace with no default route and no
+# resolver, so a relay or DNS dependency would fail the job.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: offline-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline:
+    name: offline (${{ matrix.relay-mode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # `disabled` is the strict case: no relay at all. `default` proves the
+        # same flow still finishes when iroh is allowed to try one.
+        relay-mode: [disabled, default]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --bin splice
+
+      - name: Offline test (two namespaces)
+        env:
+          SPLICE_BIN: ${{ github.workspace }}/target/release/splice
+          SPLICE_RELAY_MODE: ${{ matrix.relay-mode }}
+        run: sudo --preserve-env=SPLICE_BIN,SPLICE_RELAY_MODE bash tests/offline/offline_test.sh
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-logs-${{ matrix.relay-mode }}
+          path: /root/splice-offline/out
+          if-no-files-found: ignore
