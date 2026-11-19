@@ -499,6 +499,20 @@ mod tests {
         id
     }
 
+    /// Write a store file the way the loader expects to find it (owner-only).
+    ///
+    /// A plain `fs::write` inherits the umask, which on Linux is `0644`; the
+    /// loader then stops at the permission check, before it can report the
+    /// corruption these tests are about.
+    fn write_store_file(path: &std::path::Path, bytes: impl AsRef<[u8]>) {
+        fs::write(path, bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
     #[test]
     fn missing_file_is_an_empty_store() {
         let dir = TempDir::new().unwrap();
@@ -667,7 +681,7 @@ mod tests {
     fn corrupt_json_is_quarantined_and_live_file_kept() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(TRUST_FILE);
-        fs::write(&path, b"{not json at all").unwrap();
+        write_store_file(&path, b"{not json at all");
 
         let err = TrustStore::load_in(dir.path()).unwrap_err();
         let backup = match err {
@@ -694,7 +708,7 @@ mod tests {
     fn non_utf8_file_is_quarantined() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(TRUST_FILE);
-        fs::write(&path, [0xff, 0xfe, 0x00]).unwrap();
+        write_store_file(&path, [0xff, 0xfe, 0x00]);
         let err = TrustStore::load_in(dir.path()).unwrap_err();
         assert!(matches!(err, Error::Trust(TrustError::Corrupt { .. })));
         assert!(dir.path().join("trust.json.bak").exists());
@@ -708,7 +722,7 @@ mod tests {
             "{{\"version\":{}, \"devices\":[]}}",
             TRUST_FORMAT_VERSION + 1
         );
-        fs::write(&path, &text).unwrap();
+        write_store_file(&path, &text);
 
         let err = TrustStore::load_in(dir.path()).unwrap_err();
         assert!(matches!(
@@ -731,7 +745,7 @@ mod tests {
                 {{"node_id":"{id}","alias":"b","created_at":0,"last_seen":0,"auto_accept":false,"auto_accept_max_bytes":1}}
             ]}}"#
         );
-        fs::write(&path, &text).unwrap();
+        write_store_file(&path, &text);
         let err = TrustStore::load_in(dir.path()).unwrap_err();
         assert!(matches!(err, Error::Trust(TrustError::Corrupt { .. })));
     }
@@ -748,7 +762,7 @@ mod tests {
             node(),
             node()
         );
-        fs::write(&path, &text).unwrap();
+        write_store_file(&path, &text);
         let err = TrustStore::load_in(dir.path()).unwrap_err();
         assert!(matches!(err, Error::Trust(TrustError::Corrupt { .. })));
     }
@@ -757,11 +771,10 @@ mod tests {
     fn a_malformed_node_id_is_corrupt_not_a_panic() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join(TRUST_FILE);
-        fs::write(
+        write_store_file(
             &path,
             r#"{"version":1,"devices":[{"node_id":"zz","alias":"x","created_at":0,"last_seen":0,"auto_accept":false,"auto_accept_max_bytes":1}]}"#,
-        )
-        .unwrap();
+        );
         let err = TrustStore::load_in(dir.path()).unwrap_err();
         assert!(matches!(err, Error::Trust(TrustError::Corrupt { .. })));
     }

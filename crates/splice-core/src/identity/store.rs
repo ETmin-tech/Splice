@@ -320,7 +320,16 @@ mod tests {
     #[test]
     fn wrong_length_file_is_rejected_not_padded() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join(IDENTITY_FILE), b"too short").unwrap();
+        let path = dir.path().join(IDENTITY_FILE);
+        fs::write(&path, b"too short").unwrap();
+        // A file written by hand inherits the umask (0644 on Linux); set it to
+        // what the store itself writes so the length check, not the permission
+        // check, is what this test exercises.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let err = load_persistent_in(dir.path()).unwrap_err();
         assert!(matches!(
             err,
