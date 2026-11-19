@@ -17,7 +17,12 @@ iroh = "1.4.1"
 tokio = { version = "1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-postcard = { version = "1", features = ["use-std"] }
+# `default-features = false` drops postcard's `heapless-cas` default, which drags
+# in `heapless 0.7.17` — the version with eight RustSec "unsound" advisories
+# (RUSTSEC-2026-0574..0582). We always encode through `to_stdvec`/`take_from_bytes`
+# with `use-std`, so the no_std `heapless` collection support is dead weight, and
+# iroh-relay already builds postcard with `default-features = false` too.
+postcard = { version = "1", features = ["use-std"], default-features = false }
 blake3 = "1"
 zeroize = { version = "1", features = ["derive"] }
 rand = "0.9"

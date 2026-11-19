@@ -1,0 +1,78 @@
+# cargo-deny policy (MasterPrompt-Fase1 §9 / §D14).
+#
+# The point is to keep the dependency graph boring: a fixed, reviewed set of
+# licenses, one copy of each crate where practical, no advisories, and no
+# surprise sources. Anything that needs an exception gets it here with a reason,
+# so a future change that trips a check has to argue with this file.
+
+[graph]
+# The workspace itself is not published; only the graph is audited.
+targets = [
+  { triple = "x86_64-unknown-linux-gnu" },
+  { triple = "x86_64-pc-windows-msvc" },
+  { triple = "aarch64-apple-darwin" },
+]
+
+[advisories]
+# Fail on any advisory the RustSec database knows about, other than ones we have
+# explicitly judged. `yanked = "deny"` because a yanked version is a version whose
+# author asked you to stop using it.
+version = 2
+yanked = "deny"
+ignore = [
+  # Both are *unmaintained* notices, not vulnerabilities: neither advisory
+  # describes a memory-safety or logic flaw, and neither has a fixed release.
+  # They arrive through iroh 1.4.1, which we do not fork, so the only way to
+  # clear them is to drop iroh — a Phase 1 design decision we are not allowed to
+  # reopen. Recorded in `Laporan-1.md` §7 with the same reasoning.
+  #
+  # `paste` is a proc-macro used at build time only; it never ships in the
+  # binary. RUSTSEC-2024-0436.
+  "RUSTSEC-2024-0436",
+  # `chrono` reaches us through `wmi -> netwatch` on the Windows target only.
+  # RUSTSEC-2026-0543. Recommended alternatives (jiff, time) would mean
+  # patching iroh's own graph.
+  "RUSTSEC-2026-0543",
+]
+
+[licenses]
+# Phase 1 ships under MIT OR Apache-2.0. The allowlist covers what the graph
+# actually pulls in; adding a crate under a different license means editing this
+# list on purpose, which is the review we want.
+version = 2
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "MPL-2.0",
+  "CC0-1.0",
+  # `webpki-roots` is a *data* crate: it contains the Mozilla CA bundle and the
+  # CDLA-Permissive-2.0 covers that data, not code we link into our logic. It
+  # arrives through `iroh-relay`, and we cannot drop it while iroh is the
+  # transport. Reason recorded in `Laporan-1.md` §7.
+  "CDLA-Permissive-2.0",
+]
+# `ring` is the only crypto provider in the tree and is used unmodified.
+confidence-threshold = 0.9
+
+[licenses.private]
+# Our own unpublished crates (`splice`, `splice-core`, the S1 spike) declare their
+# license from the workspace; the spike sets `publish = false` and has no
+# `license` field of its own, so it is exempt rather than falsely attributed.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# A dependency on a git branch is a moving target; a released crate is not.
+allow-git = []
