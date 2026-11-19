@@ -83,6 +83,14 @@ async fn host(cli: &Cli) -> Result<()> {
     let advertised = mdns
         .advertise(np, node_id, local_port)
         .map_err(|e| anyhow!("mDNS advertise gagal: {e}"))?;
+    // The SRV record carries one port for every address record, so this log is
+    // what tells a failed guest dial whether it was handed the right one.
+    debug!(
+        nameplate = np,
+        port = local_port,
+        addrs = ?transport.local_addrs(),
+        "mengiklankan host di LAN"
+    );
 
     let prompter = make_prompter(cli);
     let mut trust_store = TrustStore::load()?;
@@ -414,6 +422,12 @@ async fn resolve_host(cli: &Cli, code: &Code) -> Result<NodeAddr> {
     if let Ok(mdns) = Mdns::start() {
         match mdns.lookup(code.nameplate().get(), LOOKUP_TIMEOUT).await {
             Ok(host) => {
+                debug!(
+                    nameplate = code.nameplate().get(),
+                    node = %host.node,
+                    addrs = ?host.addrs,
+                    "mDNS menemukan host"
+                );
                 if let Some(addr) = host.to_node_addr() {
                     return Ok(addr);
                 }

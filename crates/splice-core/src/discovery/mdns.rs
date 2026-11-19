@@ -61,15 +61,85 @@ pub struct AdvertisedHost {
 }
 
 impl AdvertisedHost {
-    /// A [`crate::net::NodeAddr`] with every address the advertiser published.
+    /// A [`crate::net::NodeAddr`] with every dialable address the advertiser
+    /// published, or `None` when none of them is reachable.
+    ///
+    /// A multi-homed host publishes one A/AAAA record per address, and
+    /// `mdns-sd` reports a resolution as soon as *any* of them arrives, so a
+    /// guest can be handed an IPv6 link-local address first. Dialing that
+    /// needs a zone id the DNS-SD record does not carry, so it is filtered out
+    /// here; a record with nothing else is refused rather than dialed blind.
     pub fn to_node_addr(&self) -> Option<crate::net::NodeAddr> {
-        let first = *self.addrs.first()?;
+        let dialable: Vec<_> = self
+            .addrs
+            .iter()
+            .copied()
+            .filter(|addr| is_dialable(&addr.ip()))
+            .collect();
+        let first = *dialable.first()?;
         let mut addr = crate::net::NodeAddr::direct(self.node, first);
-        for extra in &self.addrs[1..] {
+        for extra in &dialable[1..] {
             addr = addr.with_ip(*extra);
         }
         Some(addr)
     }
+}
+
+/// Whether an address is worth handing to the transport.
+///
+/// Unspecified and loopback addresses are meaningless to a peer, IPv4
+/// link-local (`169.254.0.0/16`) and IPv6 link-local (`fe80::/10`) need a
+/// scope the DNS-SD record cannot express. Everything else — including a
+/// globally routable IPv6 address — is kept.
+fn is_dialable(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !v4.is_unspecified() && !v4.is_loopback() && !v4.is_link_local()
+        }
+        std::net::IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            !v6.is_unspecified()
+                && !v6.is_loopback()
+                && !v6.is_unicast_link_local()
+                // `is_unicast_link_local` covers fe80::/10; the deprecated
+                // site-local fec0::/10 scope is equally unusable to us.
+                && (segments[0] & 0xffc0) != 0xfec0
+        }
+    }
+}
+
+/// Build an [`AdvertisedHost`] from a nameplate, node, port and candidate
+/// addresses, dropping every address a peer could not dial.
+///
+/// Returns `None` when nothing dialable is left, which the caller uses as
+/// "keep listening": a later `ServiceResolved` for the same service carries
+/// the A record that was missing from this one.
+fn from_addrs<I>(
+    nameplate: u16,
+    node: NodeId,
+    port: u16,
+    addrs: I,
+    fullname: &str,
+) -> Option<AdvertisedHost>
+where
+    I: IntoIterator<Item = std::net::IpAddr>,
+{
+    let mut dialable: Vec<std::net::SocketAddr> = addrs
+        .into_iter()
+        .filter(is_dialable)
+        .map(|ip| std::net::SocketAddr::new(ip, port))
+        .collect();
+    if dialable.is_empty() {
+        return None;
+    }
+    dialable.sort();
+    dialable.dedup();
+    Some(AdvertisedHost {
+        nameplate,
+        node,
+        addrs: dialable,
+        fullname: fullname.to_string(),
+    })
 }
 
 /// Owns a [`ServiceDaemon`] for the lifetime of the process' discovery use.
@@ -199,6 +269,12 @@ impl Mdns {
     /// filter is applied there. Advertisements with a version we do not speak, or
     /// with an unparseable NodeId, are skipped rather than failing the lookup: a
     /// newer peer on the same LAN must not make an older `splice` unusable.
+    ///
+    /// A resolution with no *dialable* address is skipped the same way. `mdns-sd`
+    /// emits one as soon as the TXT, SRV and any single address record have
+    /// arrived, which on a dual-stack host is often the IPv6 link-local address
+    /// before the A record; returning that would hand the guest an address it
+    /// cannot dial, so the loop keeps waiting for a later, usable resolution.
     pub async fn lookup(&self, nameplate: u16, timeout: Duration) -> Result<AdvertisedHost> {
         let receiver = self
             .daemon
@@ -262,19 +338,13 @@ fn from_resolved(resolved: &mdns_sd::ResolvedService, nameplate: u16) -> Option<
         return None;
     }
     let node: NodeId = properties.get_property_val_str(TXT_NODE_ID)?.parse().ok()?;
-    let port = resolved.port;
-    let mut addrs: Vec<std::net::SocketAddr> = resolved
-        .addresses
-        .iter()
-        .map(|ip| std::net::SocketAddr::new(ip.to_ip_addr(), port))
-        .collect();
-    addrs.sort();
-    Some(AdvertisedHost {
+    from_addrs(
         nameplate,
         node,
-        addrs,
-        fullname: resolved.fullname.clone(),
-    })
+        resolved.port,
+        resolved.addresses.iter().map(|ip| ip.to_ip_addr()),
+        &resolved.fullname,
+    )
 }
 
 #[cfg(test)]
@@ -309,6 +379,91 @@ mod tests {
         let name = hostname();
         assert!(!name.contains(&node.prefix8()));
         assert!(name.ends_with(".local."));
+    }
+
+    #[test]
+    fn from_addrs_skips_link_local_so_the_lookup_keeps_waiting() {
+        let node = NodeId::from_bytes([6; 32]);
+        let addrs = [
+            "fe80::5c7c:9ff:fe04:dc84".parse().unwrap(),
+            "127.0.0.1".parse().unwrap(),
+            "10.200.0.1".parse().unwrap(),
+        ];
+        let host = from_addrs(
+            5,
+            node,
+            59650,
+            addrs.iter().copied(),
+            "x._splice._udp.local.",
+        )
+        .expect("the routable address is usable");
+        assert_eq!(host.addrs, ["10.200.0.1:59650".parse().unwrap()]);
+    }
+
+    #[test]
+    fn from_addrs_reports_nothing_when_every_address_is_undialable() {
+        let node = NodeId::from_bytes([7; 32]);
+        let addrs = [
+            "fe80::5c7c:9ff:fe04:dc84".parse().unwrap(),
+            "169.254.10.20".parse().unwrap(),
+        ];
+        assert!(
+            from_addrs(
+                5,
+                node,
+                59650,
+                addrs.iter().copied(),
+                "x._splice._udp.local."
+            )
+            .is_none(),
+            "a link-local-only record must not end the lookup"
+        );
+    }
+
+    #[test]
+    fn from_addrs_keeps_a_globally_routable_ipv6_address() {
+        let node = NodeId::from_bytes([8; 32]);
+        let addrs = ["2001:db8::1".parse().unwrap()];
+        let host = from_addrs(
+            5,
+            node,
+            1234,
+            addrs.iter().copied(),
+            "x._splice._udp.local.",
+        )
+        .expect("global IPv6 is dialable");
+        assert_eq!(host.addrs, ["[2001:db8::1]:1234".parse().unwrap()]);
+    }
+
+    #[test]
+    fn to_node_addr_refuses_an_address_we_cannot_dial() {
+        let host = AdvertisedHost {
+            nameplate: 5,
+            node: NodeId::from_bytes([4; 32]),
+            // An IPv6 link-local address without a zone id: dialing it needs a
+            // scope the DNS-SD record cannot carry.
+            addrs: vec!["[fe80::5c7c:9ff:fe04:dc84]:59650".parse().unwrap()],
+            fullname: "5-04040404._splice._udp.local.".to_string(),
+        };
+        assert!(
+            host.to_node_addr().is_none(),
+            "a link-local-only advertisement is not a dialable target"
+        );
+    }
+
+    #[test]
+    fn to_node_addr_drops_undialable_addresses_and_keeps_the_rest() {
+        let host = AdvertisedHost {
+            nameplate: 5,
+            node: NodeId::from_bytes([5; 32]),
+            addrs: vec![
+                "[fe80::5c7c:9ff:fe04:dc84]:59650".parse().unwrap(),
+                "10.200.0.1:59650".parse().unwrap(),
+            ],
+            fullname: "5-05050505._splice._udp.local.".to_string(),
+        };
+        let addr = host.to_node_addr().expect("one usable address");
+        assert_eq!(addr.ip_addrs(), ["10.200.0.1:59650".parse().unwrap()]);
     }
 
     #[test]
