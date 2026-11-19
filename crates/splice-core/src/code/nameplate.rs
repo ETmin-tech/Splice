@@ -41,11 +41,11 @@ impl Nameplate {
     /// is impossible but keeps the caller honest instead of looping forever.
     pub fn random_avoiding<R: Rng + ?Sized>(taken: &[u16], rng: &mut R) -> Option<Self> {
         let span = (NAMEPLATE_MAX - NAMEPLATE_MIN + 1) as usize;
-        if taken.len() >= span {
-            return None;
-        }
         // Rejection sampling over a small space risks long loops when almost every
         // value is taken, so pick from the complement directly.
+        //
+        // Only in-range values matter: a caller passing `0` or `1000` should not
+        // shrink the free set by a value that was never selectable anyway.
         let taken_sorted: Vec<u16> = {
             let mut v: Vec<u16> = taken
                 .iter()
@@ -56,18 +56,26 @@ impl Nameplate {
             v.dedup();
             v
         };
-        let free = span - taken_sorted.len();
-        let mut pick = rng.random_range(0..free);
-        let mut candidate = NAMEPLATE_MIN;
-        for bound in taken_sorted {
-            if candidate < bound {
-                if pick == 0 {
-                    break;
-                }
-                pick -= 1;
-            }
-            candidate = bound + 1;
+        let free = span.checked_sub(taken_sorted.len())?;
+        if free == 0 {
+            return None;
         }
+        // `pick` is an index into the complement — the free values in ascending
+        // order — not a raw nameplate. Starting that far above `NAMEPLATE_MIN`
+        // and shifting up once per taken value at or below the position maps the
+        // index onto the nameplate it names. Walking `taken` and decrementing a
+        // counter instead would leave the tail of the range unreachable, and
+        // with an empty `taken` it would return `NAMEPLATE_MIN` every time.
+        let pick = rng.random_range(0..free) as u16;
+        let mut candidate = NAMEPLATE_MIN + pick;
+        for bound in taken_sorted {
+            if bound > candidate {
+                break;
+            }
+            candidate += 1;
+        }
+        // `candidate` is a free value by construction, so this only fails if the
+        // loop above is ever changed to overshoot the range.
         Self::new(candidate).ok()
     }
 }
@@ -165,5 +173,71 @@ mod tests {
                 999
             );
         }
+    }
+
+    /// `pair` calls this with an empty `taken`, so the empty case is the *normal*
+    /// path, not an edge case. It must not collapse to the first nameplate: with
+    /// every host on the LAN advertising the same nameplate a guest cannot tell
+    /// which mDNS record is the live one, and a stale record sends it to a dead
+    /// port.
+    #[test]
+    fn random_with_nothing_taken_spreads_over_the_whole_range() {
+        let mut rng = StdRng::seed_from_u64(13);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..500 {
+            let plate = Nameplate::random_avoiding(&[], &mut rng).unwrap().get();
+            assert!((NAMEPLATE_MIN..=NAMEPLATE_MAX).contains(&plate));
+            seen.insert(plate);
+        }
+        assert!(
+            seen.len() > 100,
+            "an empty `taken` must still pick widely, got {} distinct values",
+            seen.len()
+        );
+        assert!(
+            !(seen.len() == 1 && seen.contains(&NAMEPLATE_MIN)),
+            "never vary: every draw was {NAMEPLATE_MIN}"
+        );
+    }
+
+    /// The pick has to index the *complement* of `taken`, so values far above a
+    /// small hole are reachable. Before the fix the walk stopped at the last hole
+    /// and never added the remaining offset, which made every draw land in
+    /// `1..=6` for `taken = [3, 4, 5]`.
+    #[test]
+    fn random_reaches_values_above_the_holes() {
+        let mut rng = StdRng::seed_from_u64(17);
+        let taken = [3u16, 4, 5];
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..500 {
+            let plate = Nameplate::random_avoiding(&taken, &mut rng).unwrap().get();
+            assert!(!taken.contains(&plate), "picked a taken value: {plate}");
+            seen.insert(plate);
+        }
+        let top = *seen.iter().max().expect("draws");
+        assert!(
+            top > 500,
+            "the draw must reach the upper half of the space, max was {top}"
+        );
+    }
+
+    /// Every free value must be reachable and none of the taken ones: a mapping,
+    /// not merely a valid-looking sample.
+    #[test]
+    fn random_mapping_hits_every_free_value_exactly_once() {
+        let taken = [1u16, 2, 500, 999];
+        let free: Vec<u16> = (NAMEPLATE_MIN..=NAMEPLATE_MAX)
+            .filter(|n| !taken.contains(n))
+            .collect();
+        let mut rng = StdRng::seed_from_u64(19);
+        let mut seen = std::collections::HashSet::new();
+        // 20 000 draws over 995 free values: the chance of missing one is
+        // vanishing, and it keeps the test fast.
+        for _ in 0..20_000 {
+            let plate = Nameplate::random_avoiding(&taken, &mut rng).unwrap().get();
+            assert!(!taken.contains(&plate));
+            seen.insert(plate);
+        }
+        assert_eq!(seen.len(), free.len(), "every free value must be reachable");
     }
 }
