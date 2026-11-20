@@ -293,16 +293,10 @@ impl PresenceTracker {
         let beacon = Beacon::decode(datagram)?;
         let source = SocketAddr::new(from.ip(), beacon.port);
 
-        // A tag can in principle match two trusted devices; the oldest match
-        // wins, deterministically, so the result does not depend on hash order.
-        let mut matched: Option<(NodeId, i64)> = None;
-        for (node, tags) in self.tags.iter_mut() {
-            if let Some(bucket) = tags.match_now(now, beacon.tag) {
-                if matched.is_none_or(|(best, _)| *node < best) {
-                    matched = Some((*node, bucket));
-                }
-            }
-        }
+        let matched = oldest_match(self.tags.iter_mut().filter_map(|(node, tags)| {
+            tags.match_now(now, beacon.tag)
+                .map(|bucket| (*node, bucket))
+        }));
         let (node, _bucket) = matched?;
 
         let presence = PeerPresence {
@@ -466,33 +460,71 @@ impl PresenceSocket {
 /// client-isolated Wi-Fi or an offline network namespace; so we try each
 /// interface address explicitly and keep the successes.
 fn join_on_all_interfaces(socket: &socket2::Socket, group: Ipv4Addr) -> Option<Ipv4Addr> {
-    let mut egress = None;
+    let mut candidates = Vec::new();
     if let Ok(interfaces) = if_addrs::get_if_addrs() {
         for interface in interfaces {
-            let IpAddr::V4(addr) = interface.ip() else {
-                continue;
-            };
-            if addr.is_loopback() || addr.is_link_local() {
-                // Loopback has no multicast, and link-local addresses are handled by
-                // the interface's normal address anyway.
-                continue;
-            }
-            if socket.join_multicast_v4(&group, &addr).is_ok() && egress.is_none() {
-                egress = Some(addr);
+            if let IpAddr::V4(addr) = interface.ip() {
+                candidates.push(addr);
             }
         }
     }
-    if egress.is_none() {
-        // Fall back to the kernel's choice: works on a normal single-NIC host
-        // even when enumeration is restricted.
-        if socket
-            .join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)
-            .is_ok()
-        {
-            egress = Some(Ipv4Addr::UNSPECIFIED);
+    let egress = first_joined(candidates, |addr| {
+        socket.join_multicast_v4(&group, addr).is_ok()
+    });
+    if egress.is_some() {
+        return egress;
+    }
+    // Fall back to the kernel's choice: works on a normal single-NIC host
+    // even when enumeration is restricted.
+    socket
+        .join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)
+        .ok()
+        .map(|()| Ipv4Addr::UNSPECIFIED)
+}
+
+/// Whether a local IPv4 address is one to join multicast on.
+///
+/// Loopback has no multicast, and link-local addresses are reached through the
+/// interface's normal address anyway.
+fn usable_multicast_interface(addr: Ipv4Addr) -> bool {
+    !addr.is_loopback() && !addr.is_link_local()
+}
+
+/// The first candidate for which `join` succeeds, in input order.
+///
+/// Order matters: the egress interface must be the *first* one that works, so
+/// two runs on the same host pick the same interface. It is a separate function
+/// because the choice is otherwise only reachable through a real NIC.
+fn first_joined<F>(candidates: impl IntoIterator<Item = Ipv4Addr>, mut join: F) -> Option<Ipv4Addr>
+where
+    F: FnMut(&Ipv4Addr) -> bool,
+{
+    let mut egress = None;
+    for addr in candidates {
+        if !usable_multicast_interface(addr) {
+            continue;
+        }
+        if egress.is_none() && join(&addr) {
+            egress = Some(addr);
         }
     }
     egress
+}
+
+/// The matching device with the smallest `NodeId`, or `None`.
+///
+/// A tag can in principle match two trusted devices, so the winner must be
+/// deterministic: picking the smallest id makes the answer independent of hash
+/// order. Two real nodes cannot collide on an 8-byte tag, which is why this lives
+/// on its own — the tie-break is unreachable through `observe`.
+fn oldest_match(matches: impl IntoIterator<Item = (NodeId, i64)>) -> Option<(NodeId, i64)> {
+    let mut best: Option<(NodeId, i64)> = None;
+    for candidate in matches {
+        if best.is_none_or(|(id, _)| candidate.0 < id) {
+            best = Some(candidate);
+        }
+    }
+    best
 }
 
 #[cfg(test)]
@@ -507,6 +539,29 @@ mod tests {
 
     fn at(secs: u64) -> Duration {
         Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn the_oldest_matching_id_wins_regardless_of_iteration_order() {
+        // The tie-break must not depend on hash order, so the smallest id wins
+        // whatever order the candidates arrive in.
+        let candidates = [(node(0x30), 1), (node(0x20), 2), (node(0x40), 3)];
+        let expected = (node(0x20), 2);
+        assert_eq!(oldest_match(candidates), Some(expected));
+        assert_eq!(
+            oldest_match(candidates.into_iter().rev()),
+            Some(expected),
+            "reversing the input must not change the winner"
+        );
+        assert_eq!(oldest_match(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn the_oldest_match_keeps_the_first_bucket_for_a_repeated_id() {
+        // Two candidates with the same id can only come from one device, and
+        // keeping the first seen makes the result stable rather than last-wins.
+        let repeated = [(node(0x20), 7), (node(0x20), 9)];
+        assert_eq!(oldest_match(repeated), Some((node(0x20), 7)));
     }
 
     #[test]
@@ -717,5 +772,203 @@ mod tests {
             let junk = vec![0xffu8; len];
             assert!(tracker.observe(&junk, from).is_none());
         }
+    }
+
+    // The tests below pin what a mutant can flip without any behavioural test
+    // noticing: the rotating tag itself, the small accessors, and what each
+    // `Debug` impl prints. `cargo mutants` found exactly these survivors.
+
+    /// The tag value is fixed by the protocol. If the bucket arithmetic in
+    /// [`DeviceTags::at`] drifts by one bucket, devices with different clocks
+    /// silently stop matching and nothing else fails. The expected bytes come
+    /// from the KDF written in the module docs, not from this implementation.
+    #[test]
+    fn tag_for_is_pinned_to_a_golden_vector() {
+        let cases: [(u8, i64, [u8; TAG_LEN]); 4] = [
+            (0x01, 0, [0xaa, 0x03, 0xc7, 0xaa, 0x3d, 0x0f, 0x39, 0x64]),
+            (0x01, 100, [0x7c, 0xe7, 0xae, 0x34, 0x0a, 0x99, 0xec, 0x71]),
+            (0xab, 1, [0x3f, 0xf6, 0x11, 0x50, 0xfa, 0xfa, 0x28, 0xb3]),
+            (0xab, 3, [0xd6, 0x9c, 0x15, 0x54, 0xb7, 0xe3, 0x89, 0xd1]),
+        ];
+        for (node_byte, bucket, expected) in cases {
+            assert_eq!(
+                tag_for(node(node_byte), bucket).as_bytes(),
+                &expected,
+                "tag vector for node {node_byte:02x} bucket {bucket}"
+            );
+        }
+    }
+
+    /// `at(bucket)` returns the tag for `bucket` itself, not for a neighbour.
+    /// `tag_for` goes through `at`, so the golden vector above covers the middle
+    /// slot; this covers the claim that the middle slot is the requested bucket.
+    #[test]
+    fn at_returns_the_tag_of_the_bucket_it_was_given() {
+        let mut tags = DeviceTags::new(node(0x01));
+        assert_eq!(tags.at(100), tag_for(node(0x01), 100));
+        assert_eq!(tags.at(100), tags.at(100), "cached value stays put");
+    }
+
+    #[test]
+    fn trusted_counts_only_the_devices_in_the_trusted_set() {
+        let clock = Arc::new(ManualClock::at(at(1_000)));
+        let mut tracker = PresenceTracker::new(clock);
+        assert_eq!(tracker.trusted(), 0, "nothing trusted yet");
+        tracker.set_trusted(vec![node(1), node(2), node(3)]);
+        assert_eq!(tracker.trusted(), 3);
+    }
+
+    #[test]
+    fn is_online_is_true_only_for_the_matched_device() {
+        let clock = Arc::new(ManualClock::at(at(1_000)));
+        let mut tracker = PresenceTracker::new(clock.clone());
+        let peer = node(7);
+        tracker.set_trusted(vec![peer, node(8)]);
+        assert!(!tracker.is_online(peer), "not heard yet");
+        assert!(!tracker.is_online(node(8)));
+
+        let beacon = Beacon {
+            tag: tag_for(peer, bucket_at(clock.now())),
+            port: 9,
+        };
+        let from: SocketAddr = "10.0.0.7:9".parse().unwrap();
+        tracker.observe(&beacon.encode(), from).unwrap();
+
+        assert!(tracker.is_online(peer), "the beacon made it online");
+        assert!(
+            !tracker.is_online(node(8)),
+            "a different trusted device must stay offline"
+        );
+    }
+
+    #[test]
+    fn loopback_and_link_local_addresses_are_not_multicast_interfaces() {
+        assert!(!usable_multicast_interface(Ipv4Addr::new(127, 0, 0, 1)));
+        assert!(!usable_multicast_interface(Ipv4Addr::new(169, 254, 1, 2)));
+        assert!(usable_multicast_interface(Ipv4Addr::new(192, 168, 1, 5)));
+        assert!(usable_multicast_interface(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    /// The egress interface must be the *first* address that both is usable and
+    /// joins successfully, so two runs on the same host agree; a later success
+    /// must not replace it, and unusable addresses must be skipped entirely.
+    #[test]
+    fn first_joined_picks_the_first_success_in_order() {
+        let addrs = [
+            Ipv4Addr::new(127, 0, 0, 1),   // loopback: skipped, though it joins
+            Ipv4Addr::new(169, 254, 9, 9), // link-local: skipped, though it joins
+            Ipv4Addr::new(10, 0, 0, 7),    // first usable, joins
+            Ipv4Addr::new(192, 168, 1, 9), // later usable, must not win
+        ];
+        let picked = first_joined(
+            addrs,
+            // Only the last two ever succeed.
+            |addr| addr.octets()[0] == 10 || addr.octets()[0] == 192,
+        );
+        assert_eq!(picked, Some(Ipv4Addr::new(10, 0, 0, 7)));
+
+        // A failing join propagates to the next candidate.
+        let picked = first_joined(addrs, |addr| addr.octets()[0] == 192);
+        assert_eq!(picked, Some(Ipv4Addr::new(192, 168, 1, 9)));
+
+        // No success at all, and no usable address, both yield `None`.
+        assert_eq!(first_joined(addrs, |_| false), None);
+        assert_eq!(
+            first_joined([Ipv4Addr::new(127, 0, 0, 1)], |_| true),
+            None,
+            "an unusable address must be skipped even when joining works"
+        );
+    }
+
+    #[test]
+    fn presence_tag_debug_shows_the_short_prefix() {
+        let tag = PresenceTag::from_bytes([0xab, 0xcd, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(format!("{tag:?}"), "PresenceTag(abcd..)");
+    }
+
+    #[test]
+    fn beacon_debug_shows_the_tag_and_port() {
+        let beacon = Beacon {
+            tag: PresenceTag::from_bytes([0xab, 0xcd, 1, 2, 3, 4, 5, 6]),
+            port: 4242,
+        };
+        assert_eq!(
+            format!("{beacon:?}"),
+            "Beacon { tag: PresenceTag(abcd..), port: 4242 }"
+        );
+    }
+
+    #[test]
+    fn peer_presence_debug_shows_the_address_and_last_seen() {
+        let presence = PeerPresence {
+            node: node(0xab),
+            addr: "10.0.0.9:8080".parse().unwrap(),
+            last_seen: at(1_234),
+        };
+        assert_eq!(
+            format!("{presence:?}"),
+            "PeerPresence { node: NodeId(abababab), addr: 10.0.0.9:8080, last_seen_secs: 1234 }"
+        );
+    }
+
+    #[test]
+    fn presence_tracker_debug_shows_the_counts_not_the_maps() {
+        let clock = Arc::new(ManualClock::at(at(1_000)));
+        let mut tracker = PresenceTracker::new(clock.clone());
+        tracker.set_trusted(vec![node(1), node(2)]);
+        let beacon = Beacon {
+            tag: tag_for(node(1), bucket_at(clock.now())),
+            port: 3,
+        };
+        tracker
+            .observe(&beacon.encode(), "10.0.0.1:3".parse().unwrap())
+            .unwrap();
+        assert_eq!(
+            format!("{tracker:?}"),
+            "PresenceTracker { trusted: 2, online: 1 }"
+        );
+    }
+
+    /// `Debug` must not recurse into the socket; it prints the bound port and the
+    /// group, and it must actually print them (a `Debug` that emits nothing would
+    /// still compile and would still make every log line useless).
+    #[tokio::test]
+    async fn presence_socket_debug_and_port_report_the_bound_socket() {
+        let socket = PresenceSocket::bind(0).expect("bind an ephemeral presence port");
+        let port = socket.port();
+        assert_ne!(port, 0, "binding port 0 must yield a real port");
+        assert_eq!(socket.group(), PRESENCE_GROUP_V4);
+
+        let debug = format!("{socket:?}");
+        assert!(debug.contains("PresenceSocket"), "got {debug:?}");
+        assert!(debug.contains(&format!("port: {port}")), "got {debug:?}");
+        assert!(
+            debug.contains(&format!("group: {}", PRESENCE_GROUP_V4)),
+            "got {debug:?}"
+        );
+    }
+
+    /// `send` must put real bytes on the wire. Two sockets share the group, so a
+    /// beacon sent by one is received by the other; a `send` that returns `Ok(())`
+    /// without transmitting leaves the receiver empty.
+    #[tokio::test]
+    async fn send_actually_transmits_a_beacon() {
+        let receiver = PresenceSocket::bind(PRESENCE_PORT).expect("bind the receiver");
+        let sender = PresenceSocket::bind(PRESENCE_PORT).expect("bind the sender");
+        let beacon = Beacon {
+            tag: tag_for(node(0x5a), bucket_at(Duration::from_secs(0))),
+            port: sender.port(),
+        };
+
+        sender.send(&beacon).await.expect("send a beacon");
+
+        let (buffer, len, _from) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .expect("a beacon must arrive before the timeout")
+            .expect("recv must not fail");
+        assert_eq!(
+            Beacon::decode(&buffer[..len]).map(|b| b.port),
+            Some(beacon.port)
+        );
     }
 }
