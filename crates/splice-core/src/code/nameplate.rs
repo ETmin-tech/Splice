@@ -145,6 +145,30 @@ mod tests {
         );
     }
 
+    /// The digit cap is a *count*, not a numeric bound: `parse::<u16>` would accept
+    /// `00007` as `7`, so a five-character nameplate has to be rejected on its
+    /// length before the numeric range check ever runs. Writing the guard as
+    /// `s.len() == 4` passes every other case in this module and still lets
+    /// `00007` through — which is exactly the mutant cargo-mutants found.
+    #[test]
+    fn rejects_over_long_digit_strings_even_when_the_value_fits() {
+        assert_eq!(
+            "00007".parse::<Nameplate>(),
+            Err(CodeError::NameplateOutOfRange),
+            "a five-digit string is over the cap even though it parses as 7"
+        );
+        assert_eq!(
+            "0001".parse::<Nameplate>(),
+            Ok(Nameplate::new(1).unwrap()),
+            "four digits are still allowed, so the cap is 4 and not 3"
+        );
+        assert_eq!(
+            "9999".parse::<Nameplate>(),
+            Err(CodeError::NameplateOutOfRange),
+            "four digits can still be out of range"
+        );
+    }
+
     #[test]
     fn random_avoids_taken_values() {
         let mut rng = StdRng::seed_from_u64(7);

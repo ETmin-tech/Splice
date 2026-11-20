@@ -254,6 +254,20 @@ mod tests {
     }
 
     #[test]
+    fn the_length_cap_is_exclusive_of_the_cap_itself() {
+        // 64 characters is still handled by the shape check, so the cap must
+        // only reject strictly longer input. `>=` would turn a merely
+        // misshapen code into TooLong and hide the real error.
+        let at_cap = format!("7-{}", "a".repeat(62));
+        assert_eq!(at_cap.len(), 64);
+        assert_eq!(Code::parse(&at_cap).unwrap_err(), CodeError::Shape);
+        assert_eq!(
+            Code::parse(&format!("7-{}", "a".repeat(63))).unwrap_err(),
+            CodeError::TooLong
+        );
+    }
+
+    #[test]
     fn rejects_zero_nameplate() {
         assert_eq!(
             Code::parse("0-torch-crystal").unwrap_err(),
