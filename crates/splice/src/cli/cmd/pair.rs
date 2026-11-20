@@ -265,7 +265,14 @@ async fn serve_guest(
             println!("✅ {} tersimpan", consent.alias);
             info!(%node_id, %peer, alias=%consent.alias, "perangkat tepercaya ditambahkan");
         }
-        other => warn!(msg=?other.name(), "diharapkan TrustAck"),
+        other => {
+            // §5.4 step 9: only a `TrustAck` is consent. Anything else means the
+            // peer never agreed, so nothing is stored and this is not a success:
+            // reporting `Ok(Some(()))` here would exit 0 on a device that is
+            // absent from the trust store.
+            warn!(msg=?other.name(), "diharapkan TrustAck");
+            return decline(&mut tx, &mut rx, ByeReason::Protocol).await;
+        }
     }
 
     Ok(Some(()))
@@ -411,19 +418,41 @@ async fn join(cli: &Cli, code_str: Option<&str>) -> Result<()> {
     }
 
     write_control(&mut tx, &ControlMsg::TrustAck).await?;
-    let ack = timeout(READ_TIMEOUT, read_control(&mut rx))
-        .await
-        .map_err(|_| anyhow!("batas waktu menunggu TrustAck host"))??;
-    match ack {
-        ControlMsg::TrustAck => {
-            record_peer(&mut TrustStore::load()?, peer, &consent, SystemClock.now())?;
-            println!("✅ {} tersimpan", consent.alias);
-        }
-        other => warn!(msg=?other.name(), "diharapkan TrustAck"),
-    }
+
+    confirm_trust_ack(&mut tx, &mut rx).await?;
+    record_peer(&mut TrustStore::load()?, peer, &consent, SystemClock.now())?;
+    println!("✅ {} tersimpan", consent.alias);
 
     info!("pairing selesai");
     Ok(())
+}
+
+/// §5.4 step 9, guest side: only a `TrustAck` means the host agreed.
+///
+/// A prompt answered with anything else is not consent, so this fails instead of
+/// letting `join` print "pairing selesai" for a device that was never stored.
+async fn confirm_trust_ack(
+    tx: &mut splice_core::net::SendStream,
+    rx: &mut splice_core::net::RecvStream,
+) -> Result<()> {
+    let ack = timeout(READ_TIMEOUT, read_control(rx))
+        .await
+        .map_err(|_| anyhow!("batas waktu menunggu TrustAck host"))??;
+    match ack {
+        ControlMsg::TrustAck => Ok(()),
+        other => {
+            warn!(msg=?other.name(), "diharapkan TrustAck");
+            write_control(
+                tx,
+                &ControlMsg::Bye {
+                    reason: ByeReason::Protocol,
+                },
+            )
+            .await?;
+            await_peer_hangup(rx).await;
+            anyhow::bail!("host tidak menyetujui pertukaran kepercayaan")
+        }
+    }
 }
 
 /// Resolve the host address: mDNS, then `--addr`.
@@ -497,7 +526,7 @@ mod tests {
         let wrong = splice_core::secret::SecretString::from_string("not-the-real-code".to_string());
         for _ in 0..3 {
             let guest = id(0x80);
-            let (mut pake, our_msg) = splice_core::pairing::PakeState::start(
+            let (pake, our_msg) = splice_core::pairing::PakeState::start(
                 splice_core::pairing::Role::Guest,
                 &wrong,
                 guest,
@@ -583,6 +612,242 @@ mod tests {
             format!("device-{}", peer.prefix8()),
             "the alias we send must not be built from the peer's id"
         );
+    }
+
+    /// §5.4 step 9: only a `TrustAck` means the peer agreed.
+    ///
+    /// Neither side may treat any other final message as consent. Before this was
+    /// fixed, a peer that answered the prompt with something else was never
+    /// recorded, yet the host still returned success, so `splice pair` printed
+    /// nothing and exited 0 while the device was missing from the trust store.
+    /// This drives the real `serve_guest` with a guest that runs the whole
+    /// handshake and then says `Paired` instead of `TrustAck`.
+    #[tokio::test]
+    async fn a_missing_trust_ack_is_a_protocol_failure() {
+        use splice_core::code::WordCount;
+        use splice_core::net::Transport;
+
+        let net = Network::new();
+        let (guest_id, host_id) = (id(0xd1), id(0xd2));
+        let host_ep = net.endpoint_with(host_id, false);
+        let guest_ep = net.endpoint_with(guest_id, false);
+
+        let nameplate = Nameplate::new(11).expect("nameplate");
+        let mut rng = rand::rng();
+        let the_code = Code::generate(&mut rng, WordCount::Two, nameplate).expect("code");
+        let mut host = HostSession::new(host_id, HelloMode::Pair, the_code.clone(), Instant::now())
+            .expect("host session");
+
+        let dir = TempDir::new().expect("temp dir");
+        let mut store = TrustStore::load_in(dir.path()).expect("store");
+        let prompter = AlwaysYes;
+        let code_for_guest = the_code.clone();
+
+        let host_half = async {
+            let conn = host_ep
+                .accept()
+                .await
+                .expect("accept")
+                .expect("the guest dials");
+            assert_eq!(conn.remote_id(), guest_id);
+            let result = serve_guest(
+                &mut host,
+                conn.as_ref(),
+                guest_id,
+                &prompter,
+                &mut store,
+                host_id,
+            )
+            .await;
+            (result, conn)
+        };
+
+        let guest_half = async {
+            let conn = guest_ep
+                .connect(host_ep.hint(), REQUIRED_ALPN)
+                .await
+                .expect("dial the host");
+            let (mut tx, mut rx) = conn.open_bi().await.expect("open the CONTROL stream");
+
+            let (mut guest, opening) = GuestSession::begin(
+                guest_id,
+                host_id,
+                HelloMode::Pair,
+                code_for_guest,
+                Instant::now(),
+            )
+            .expect("guest session");
+            for msg in &opening {
+                write_control(&mut tx, msg).await.expect("write opening");
+            }
+
+            // PAKE: the host shares first, then we answer and verify its confirm.
+            for step_name in ["pake msg", "pake confirm"] {
+                let msg = read_control(&mut rx).await.expect(step_name);
+                let step = guest
+                    .on_message(host_id, msg, Instant::now())
+                    .expect("guest on_message");
+                if let Some(outcome) = apply_step(&mut tx, step).await.expect("apply step") {
+                    panic!("the guest ended early at {step_name}: {}", outcome.name());
+                }
+            }
+            assert_eq!(guest.phase(), PairingPhase::Paired, "precondition");
+
+            // Trust exchange, in the wire order the host expects: it sends first.
+            assert_eq!(
+                read_control(&mut rx).await.expect("Paired"),
+                ControlMsg::Paired {
+                    caps: splice_core::proto::messages::Caps::NONE
+                }
+            );
+            assert!(matches!(
+                read_control(&mut rx).await.expect("TrustExchange"),
+                ControlMsg::TrustExchange { .. }
+            ));
+            write_control(
+                &mut tx,
+                &ControlMsg::TrustExchange {
+                    alias: "dapur".to_string(),
+                },
+            )
+            .await
+            .expect("write our name");
+            assert_eq!(
+                read_control(&mut rx).await.expect("TrustAck"),
+                ControlMsg::TrustAck,
+                "the host must ask before it stores anything"
+            );
+
+            // The misbehaviour: answer the prompt with the wrong message.
+            write_control(
+                &mut tx,
+                &ControlMsg::Paired {
+                    caps: splice_core::proto::messages::Caps::NONE,
+                },
+            )
+            .await
+            .expect("write the wrong frame");
+
+            let reply = timeout(Duration::from_secs(3), read_control(&mut rx))
+                .await
+                .expect("the host must answer, not leave the guest waiting")
+                .expect("read the host's answer");
+            assert_eq!(
+                reply,
+                ControlMsg::Bye {
+                    reason: ByeReason::Protocol
+                },
+                "a missing TrustAck is a protocol failure, not silence"
+            );
+            // Hang up so the host's linger does not have to wait out its timeout.
+            conn.close(0, b"");
+        };
+
+        let ((result, _conn), ()) = tokio::join!(host_half, guest_half);
+
+        assert!(
+            matches!(result, Ok(None)),
+            "no ack means this guest did not pair, got {result:?}"
+        );
+        assert!(
+            store.get(&guest_id).is_none(),
+            "a peer that never acknowledged must not be in the trust store"
+        );
+    }
+
+    /// The guest half of the same rule: a host that answers the prompt with anything
+    /// but `TrustAck` has not agreed, so the guest must fail (and say `Bye`) rather
+    /// than report a finished pairing.
+    #[tokio::test]
+    async fn the_guest_refuses_a_host_that_never_acks() {
+        use splice_core::net::Transport;
+
+        let net = Network::new();
+        let (guest_id, host_id) = (id(0xe1), id(0xe2));
+        let host_ep = net.endpoint_with(host_id, false);
+        let guest_ep = net.endpoint_with(guest_id, false);
+
+        let host_half = async {
+            let conn = host_ep
+                .accept()
+                .await
+                .expect("accept")
+                .expect("the guest dials");
+            let (mut tx, mut rx) = conn.accept_bi().await.expect("host stream");
+            // The prompt was answered with the wrong message.
+            write_control(
+                &mut tx,
+                &ControlMsg::Paired {
+                    caps: splice_core::proto::messages::Caps::NONE,
+                },
+            )
+            .await
+            .expect("write the wrong frame");
+            // The guest must answer with `Bye{Protocol}`, not silence.
+            let reply = timeout(Duration::from_secs(3), read_control(&mut rx))
+                .await
+                .expect("the guest must answer, not hang up silently")
+                .expect("read the guest's answer");
+            assert_eq!(
+                reply,
+                ControlMsg::Bye {
+                    reason: ByeReason::Protocol
+                }
+            );
+        };
+
+        let guest_half = async {
+            let conn = guest_ep
+                .connect(host_ep.hint(), REQUIRED_ALPN)
+                .await
+                .expect("dial");
+            let (mut tx, mut rx) = conn.open_bi().await.expect("guest stream");
+            let result = confirm_trust_ack(&mut tx, &mut rx).await;
+            assert!(
+                result.is_err(),
+                "a host that never acked has not agreed; got {result:?}"
+            );
+            conn.close(0, b"");
+        };
+
+        tokio::join!(host_half, guest_half);
+    }
+
+    /// The control: a real `TrustAck` is accepted, so the test above is failing for
+    /// the right reason and not because every read errors.
+    #[tokio::test]
+    async fn the_guest_accepts_a_real_trust_ack() {
+        use splice_core::net::Transport;
+
+        let net = Network::new();
+        let (guest_id, host_id) = (id(0xf1), id(0xf2));
+        let host_ep = net.endpoint_with(host_id, false);
+        let guest_ep = net.endpoint_with(guest_id, false);
+
+        let host_half = async {
+            let conn = host_ep
+                .accept()
+                .await
+                .expect("accept")
+                .expect("the guest dials");
+            let (mut tx, _rx) = conn.accept_bi().await.expect("host stream");
+            write_control(&mut tx, &ControlMsg::TrustAck)
+                .await
+                .expect("write the ack");
+        };
+
+        let guest_half = async {
+            let conn = guest_ep
+                .connect(host_ep.hint(), REQUIRED_ALPN)
+                .await
+                .expect("dial");
+            let (mut tx, mut rx) = conn.open_bi().await.expect("guest stream");
+            confirm_trust_ack(&mut tx, &mut rx)
+                .await
+                .expect("a real TrustAck must be accepted");
+        };
+
+        tokio::join!(host_half, guest_half);
     }
 
     /// The entry stored for the peer carries the name the peer sent, under the
