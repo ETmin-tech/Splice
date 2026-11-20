@@ -220,13 +220,14 @@ impl HostSession {
                     return Ok(self.reject(Outcome::ProtocolViolation));
                 }
                 if let Some(plate) = self.nameplate {
-                    if let Some(hello_plate) = hello_nameplate {
-                        if hello_plate != plate {
-                            // A wrong nameplate is not a guess: it is a misdial or a
-                            // probe, and must not spend an attempt.
-                            return Ok(self.reject(Outcome::ProtocolViolation));
-                        }
-                    } else if self.mode != HelloMode::OneShot && self.mode != HelloMode::Pair {
+                    // §5.4 step 4: the nameplate must match. `self.nameplate` is
+                    // `Some` exactly in code mode (`build` refuses `Trusted` and ties
+                    // the field to the code), so a missing nameplate is a mismatch
+                    // too — not a "mode without nameplates", which is ticket mode and
+                    // has `self.nameplate == None`.
+                    if hello_nameplate != Some(plate) {
+                        // A wrong nameplate is not a guess: it is a misdial or a
+                        // probe, and must not spend an attempt.
                         return Ok(self.reject(Outcome::ProtocolViolation));
                     }
                 } else if hello_nameplate.is_some() {
@@ -522,6 +523,40 @@ mod tests {
                 ..
             }
         ));
+        assert_eq!(s.attempts_left(), PAIRING_ATTEMPTS_MAX);
+    }
+
+    #[test]
+    fn a_code_host_refuses_a_hello_without_a_nameplate() {
+        // §5.4 step 4: the host checks the nameplate matches. A `Hello` that omits
+        // it cannot match, so it must be refused. The old `else if ... != OneShot
+        // && ... != Pair` guard could never fire: `build` refuses `Trusted`, so
+        // `nameplate.is_some()` implies one of the two code modes. The effect was
+        // that a code-mode guest could skip the check altogether.
+        let (mut s, _code, _h, guest) = session_on(HelloMode::OneShot);
+        let step = s
+            .on_message(
+                guest,
+                ControlMsg::Hello {
+                    version: crate::constants::PROTOCOL_VERSION,
+                    mode: HelloMode::OneShot,
+                    nameplate: None,
+                    resume: None,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                step,
+                Step::ReplyThenClose {
+                    outcome: Outcome::ProtocolViolation,
+                    ..
+                }
+            ),
+            "a Hello without a nameplate must be refused, got {step:?}"
+        );
+        assert_eq!(s.phase(), PairingPhase::WaitingForGuest);
         assert_eq!(s.attempts_left(), PAIRING_ATTEMPTS_MAX);
     }
 
