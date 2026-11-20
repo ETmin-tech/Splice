@@ -52,9 +52,34 @@ jobs:
       # the default config location; every other case passes an explicit temp dir
       # to `load_in`. So the default `cargo test` parallel schedule is safe here.
       - name: Test
-        run: cargo test --workspace --no-fail-fast
+        # Redirect to a file (portable across the three shells): the digest step
+        # below turns a failure into annotations, which anyone can read, whereas
+        # the raw job log needs admin rights. macOS is the one runner we cannot
+        # reproduce locally, so its failures must be self-describing.
+        run: cargo test --workspace --no-fail-fast > test-output.txt 2>&1
         env:
           RUST_BACKTRACE: "1"
+
+      - name: Test failure digest
+        if: failure()
+        shell: bash
+        run: |
+          echo "=== failing tests ==="
+          grep -nE '^test .* FAILED|^---- |panicked at|assertion .* failed|^thread .* panicked|^error' \
+            test-output.txt | head -12 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+          # A host summary as an annotation too: the raw log is not public, and
+          # macOS is the one platform we cannot reproduce locally.
+          {
+            echo "host: $(uname -srm 2>/dev/null || echo unknown)"
+            ifconfig 2>/dev/null | grep -E '^[a-z]|inet ' | head -40 || true
+          } > host-summary.txt
+          while IFS= read -r line; do
+            echo "::notice::$line"
+          done < host-summary.txt
+          echo "=== last 150 lines of test output ==="
+          tail -150 test-output.txt || true
 
   deny:
     name: deny
