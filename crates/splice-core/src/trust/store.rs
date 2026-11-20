@@ -79,11 +79,6 @@ impl TrustEntry {
     pub fn mark_seen(&mut self, now: Duration) {
         self.last_seen = now.as_secs();
     }
-
-    /// The short id shown next to the alias in prompts and in `splice devices`.
-    pub fn shorthand(&self) -> String {
-        self.node_id.shorthand()
-    }
 }
 
 /// The file as it appears on disk. Kept separate from [`TrustEntry`] so the wire

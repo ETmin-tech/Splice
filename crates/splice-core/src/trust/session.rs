@@ -378,6 +378,8 @@ mod tests {
         let store = store_with(&dir, &[peer]);
         let mut server = TrustedServer::new(&store, peer);
         assert!(server.is_trusted());
+        // Before `Hello` the trusted path serves nothing (I2).
+        assert!(!server.is_ready());
 
         assert_eq!(server.on_message(trusted_hello()), TrustedStep::Idle);
         assert!(server.is_ready());
@@ -533,6 +535,18 @@ mod tests {
         }
     }
 
+    /// The names are user-visible log text, so they are pinned exactly. A
+    /// placeholder here would make every log line useless while still being
+    /// "non-empty".
+    #[test]
+    fn every_outcome_keeps_its_own_name() {
+        assert_eq!(TrustedOutcome::NotTrusted.name(), "not trusted");
+        assert_eq!(TrustedOutcome::WrongMode.name(), "wrong mode");
+        assert_eq!(TrustedOutcome::Protocol.name(), "protocol");
+        assert_eq!(TrustedOutcome::PeerBye.name(), "peer bye");
+        assert_eq!(TrustedOutcome::AlreadyClosed.name(), "already closed");
+    }
+
     #[test]
     fn the_trust_decision_is_frozen_at_connection_time() {
         let dir = TempDir::new().unwrap();
@@ -607,6 +621,7 @@ mod tests {
         assert!(active.is_empty());
         active.register(conn.clone());
         assert_eq!(active.len(), 1);
+        assert!(!active.is_empty());
         active.unregister(&conn);
         active.unregister(&conn);
         assert!(active.is_empty());
@@ -618,5 +633,26 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    /// The Debug impl is what appears in logs when a removal races a session,
+    /// so it must report the live count rather than an empty struct. It must
+    /// also not print the connections themselves.
+    #[tokio::test]
+    async fn active_trusted_debug_reports_the_live_count() {
+        let net = Network::new();
+        let peer = node();
+        let local = node();
+        let peer_ep = net.endpoint_with(peer, false);
+        let local_ep = net.endpoint_with(local, false);
+
+        let active = ActiveTrusted::new();
+        assert!(format!("{active:?}").contains("count: 0"));
+
+        let conn = local_ep.connect(peer_ep.hint(), ALPN).await.expect("dial");
+        active.register(conn.clone());
+        let rendered = format!("{active:?}");
+        assert!(rendered.contains("ActiveTrusted"), "got {rendered}");
+        assert!(rendered.contains("count: 1"), "got {rendered}");
     }
 }
