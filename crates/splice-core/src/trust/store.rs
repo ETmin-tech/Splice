@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::constants::{ALIAS_MAX_LEN, AUTO_ACCEPT_MAX_BYTES};
 use crate::error::{Error, Result, TrustError};
 use crate::identity::{config_dir, NodeId};
-use crate::proto::messages::sanitize_alias;
+use crate::proto::messages::{is_invisible_format, sanitize_alias};
 
 /// File name inside the config directory.
 pub const TRUST_FILE: &str = "trust.json";
@@ -128,6 +128,12 @@ impl TrustRecord {
         if self.alias.chars().any(char::is_control) {
             return Err(format!(
                 "device {} has a control character in its alias",
+                node_id.prefix8()
+            ));
+        }
+        if self.alias.chars().any(is_invisible_format) {
+            return Err(format!(
+                "device {} has an invisible formatting character in its alias",
                 node_id.prefix8()
             ));
         }
@@ -770,6 +776,36 @@ mod tests {
             &path,
             r#"{"version":1,"devices":[{"node_id":"zz","alias":"x","created_at":0,"last_seen":0,"auto_accept":false,"auto_accept_max_bytes":1}]}"#,
         );
+        let err = TrustStore::load_in(dir.path()).unwrap_err();
+        assert!(matches!(err, Error::Trust(TrustError::Corrupt { .. })));
+    }
+
+    #[test]
+    fn an_invisible_format_character_in_the_file_is_corrupt() {
+        // `sanitize_alias` strips these on the way in, so the only way one reaches
+        // the store is a hand-edited or foreign file. It must be refused there too:
+        // the alias is rendered in `splice devices` and in the consent prompt.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(TRUST_FILE);
+        let text = format!(
+            r#"{{"version":1,"devices":[{{"node_id":"{}","alias":"lap\u202etop","created_at":0,"last_seen":0,"auto_accept":false,"auto_accept_max_bytes":1}}]}}"#,
+            node()
+        );
+        write_store_file(&path, &text);
+        let err = TrustStore::load_in(dir.path()).unwrap_err();
+        assert!(matches!(err, Error::Trust(TrustError::Corrupt { .. })));
+    }
+
+    #[test]
+    fn a_control_character_in_the_file_is_corrupt() {
+        // The neighbouring check the format-character one was added beside.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(TRUST_FILE);
+        let text = format!(
+            r#"{{"version":1,"devices":[{{"node_id":"{}","alias":"lap\u001btop","created_at":0,"last_seen":0,"auto_accept":false,"auto_accept_max_bytes":1}}]}}"#,
+            node()
+        );
+        write_store_file(&path, &text);
         let err = TrustStore::load_in(dir.path()).unwrap_err();
         assert!(matches!(err, Error::Trust(TrustError::Corrupt { .. })));
     }

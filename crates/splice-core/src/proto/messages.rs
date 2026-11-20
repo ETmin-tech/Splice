@@ -178,12 +178,17 @@ impl ControlMsg {
 /// Alias sanitization (§5.4 step 9, `ALIAS_MAX_LEN`).
 ///
 /// Strips control characters (which could otherwise rewrite the prompt line),
-/// trims, collapses internal whitespace, and truncates on a character boundary.
-/// An empty result is an error: the prompt needs something to print.
+/// strips invisible bidi and format characters (which could reorder it or hide
+/// part of an alias), trims, collapses internal whitespace, and truncates on a
+/// character boundary. An empty result is an error: the prompt needs something to
+/// print.
 pub fn sanitize_alias(raw: &str) -> Result<String, Error> {
     let mut out = String::with_capacity(raw.len().min(ALIAS_MAX_LEN));
     let mut last_was_space = false;
     for ch in raw.chars() {
+        if is_invisible_format(ch) {
+            continue;
+        }
         let ch = if ch.is_control() { ' ' } else { ch };
         if ch == ' ' || ch == '\u{00a0}' || ch == '\u{200b}' {
             if last_was_space || out.is_empty() {
@@ -204,6 +209,28 @@ pub fn sanitize_alias(raw: &str) -> Result<String, Error> {
         return Err(crate::error::TrustError::EmptyAlias.into());
     }
     Ok(trimmed)
+}
+
+/// Whether `ch` is an invisible formatting character that has no place in an alias.
+///
+/// These are not `char::is_control` (they are in category `Cf`), so the control
+/// filter misses them, yet they can reorder a rendered line or make text
+/// disappear: a guest could otherwise choose an alias that makes the `[y/N]`
+/// prompt read as a different device's name. Format characters (U+200B..U+200F,
+/// U+2060..U+206F, U+FEFF, soft hyphen) and the bidi controls (U+061C,
+/// U+202A..U+202E) are all refused.
+///
+/// Shared with [`crate::trust::store`], which re-validates a hand-edited file.
+pub const fn is_invisible_format(ch: char) -> bool {
+    matches!(ch,
+        '\u{00ad}'                  // soft hyphen
+        | '\u{061c}'                // arabic letter mark
+        | '\u{200b}'..='\u{200f}'   // zero width space .. right-to-left mark
+        | '\u{202a}'..='\u{202e}'   // bidi embeddings and overrides
+        | '\u{2060}'..='\u{2064}'   // word joiner .. invisible plus
+        | '\u{2066}'..='\u{206f}'   // bidi isolates .. deprecated format chars
+        | '\u{feff}'                // zero width no-break space
+    )
 }
 
 /// A message that can travel in a CONTROL frame body.
@@ -372,6 +399,26 @@ mod tests {
                 sanitize_alias(raw),
                 Err(Error::Trust(TrustError::EmptyAlias))
             ));
+        }
+    }
+
+    /// Bidi overrides and invisible formatting characters are not char::is_control,
+    /// so the control-character filter lets them through and they can reorder the
+    /// [y/N] prompt or hide part of an alias from the human reading it.
+    #[test]
+    fn alias_strips_invisible_bidi_and_format_characters() {
+        for hidden in [
+            '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', // LRE RLE PDF LRO RLO
+            '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', // LRI RLI FSI PDI
+            '\u{200e}', '\u{200f}', '\u{061c}', '\u{feff}', '\u{00ad}',
+        ] {
+            let raw = format!("a{hidden}b");
+            let alias = sanitize_alias(&raw).expect("not empty");
+            assert!(
+                !alias.contains(hidden),
+                "U+{:04X} survived sanitizing: {alias:?}",
+                hidden as u32
+            );
         }
     }
 
