@@ -1,0 +1,100 @@
+name: ci
+
+# Phase 1 quality gates (MasterPrompt-Fase1 §9 / Architecture §14).
+#
+# Every job runs the same commands a developer is told to run locally:
+#   cargo fmt --all --check
+#   cargo clippy --workspace --all-targets -- -D warnings
+#   cargo test --workspace
+# `deny` and `audit` get their own jobs because they consume the lockfile
+# rather than the compiler, and because an advisory database outage must not
+# masquerade as a broken build.
+#
+# The offline venue (tests/offline) and the discovery benchmark (tests/discovery)
+# are Linux-only and need root plus `ip netns`; they live in offline.yml so this
+# workflow stays a plain hosted-runner job.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # `pair_then_dev_ping_reaches_the_trusted_device` sets SPLICE_CONFIG_DIR,
+      # which is process-global, but it is the only case in the binary that reads
+      # the default config location; every other case passes an explicit temp dir
+      # to `load_in`. So the default `cargo test` parallel schedule is safe here.
+      - name: Test
+        run: cargo test --workspace
+        env:
+          RUST_BACKTRACE: "1"
+
+  deny:
+    name: deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit
+        run: cargo audit
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Deny broken intra-doc links: the architecture references module docs by
+      # path, so a renamed module must fail here rather than in a review.
+      - name: rustdoc
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
