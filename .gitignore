@@ -7,6 +7,9 @@
 
 # Tool artifacts
 /graphify-out/
+# cargo-mutants rewrites sources in place and leaves its results tree behind
+/mutants.out/
+/crates/splice-core/proptest-regressions/
 
 # Local config and secrets that must never be committed
 *.key
