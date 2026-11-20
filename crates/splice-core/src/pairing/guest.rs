@@ -535,5 +535,99 @@ mod tests {
         for word in words.split('-') {
             assert!(!text.contains(word), "Debug leaked a word");
         }
+        // Redaction is only worth anything if the line still says something, so
+        // the fields a log reader needs must survive. A `Debug` that prints
+        // nothing at all would pass the loop above.
+        assert!(text.contains("GuestSession"), "Debug lost the type: {text}");
+        assert!(
+            text.contains("phase: Pairing"),
+            "Debug lost the phase: {text}"
+        );
+        assert!(
+            text.contains(&ids().1.prefix8()),
+            "Debug lost the peer: {text}"
+        );
+    }
+
+    #[test]
+    fn the_deadline_and_timer_are_armed_then_cleared() {
+        // The caller arms its timer from `next_timer` and prints `deadline`; a
+        // `None` here would let a stalled exchange wait forever, and a zero
+        // duration would fire immediately on every poll.
+        let (g, h) = ids();
+        let start = Instant::now();
+        let (s, _) = GuestSession::begin(g, h, HelloMode::Pair, code(), start).unwrap();
+        assert_eq!(s.deadline(), Some(start + HANDSHAKE_TIMEOUT));
+        assert_eq!(s.next_timer(start), Some(HANDSHAKE_TIMEOUT));
+        assert_eq!(
+            s.next_timer(start + Duration::from_secs(4)),
+            Some(HANDSHAKE_TIMEOUT - Duration::from_secs(4))
+        );
+
+        let mut s = s;
+        s.on_timeout(start + HANDSHAKE_TIMEOUT);
+        assert_eq!(s.deadline(), None);
+        assert_eq!(s.next_timer(start + HANDSHAKE_TIMEOUT), None);
+    }
+
+    #[test]
+    fn a_message_after_the_deadline_is_timed_out() {
+        // A reply that was already in flight when the deadline passed must not
+        // keep the exchange alive (the same rule the host applies).
+        let (mut s, _) = guest();
+        let start = Instant::now();
+        let step = s
+            .on_message(ids().1, ControlMsg::Ping, start + HANDSHAKE_TIMEOUT)
+            .unwrap();
+        assert!(matches!(
+            step,
+            Step::ReplyThenClose {
+                outcome: Outcome::TimedOut,
+                ..
+            }
+        ));
+        assert_eq!(s.phase(), PairingPhase::Burned);
+    }
+
+    #[test]
+    fn a_ping_is_answered_before_confirmation() {
+        // `Ping`/`Pong` is the liveness check the caller uses on a CONTROL
+        // stream that has no application traffic yet.
+        let (mut s, _) = guest();
+        let step = s
+            .on_message(ids().1, ControlMsg::Ping, Instant::now())
+            .unwrap();
+        assert_eq!(step, Step::Reply(ControlMsg::Pong));
+        assert_eq!(s.phase(), PairingPhase::Pairing);
+    }
+
+    #[test]
+    fn every_bye_reason_maps_to_its_outcome() {
+        // A `Bye` is the peer's verdict, and the caller shows it to the user.
+        // Collapsing any arm into the `_ => Failed` catch-all would tell someone
+        // whose code was burned, or whose handshake timed out, that the guess
+        // was merely wrong.
+        for (reason, expected) in [
+            (ByeReason::Burned, Outcome::Burned),
+            (ByeReason::Timeout, Outcome::TimedOut),
+            (ByeReason::Declined, Outcome::ProtocolViolation),
+            (ByeReason::Protocol, Outcome::Failed),
+            (ByeReason::Revoked, Outcome::Failed),
+            (ByeReason::NotTrusted, Outcome::Failed),
+            (ByeReason::Normal, Outcome::Failed),
+        ] {
+            let (mut s, _) = guest();
+            let step = s
+                .on_message(ids().1, ControlMsg::Bye { reason }, Instant::now())
+                .unwrap();
+            match step {
+                Step::ReplyThenClose { reply, outcome } => {
+                    assert_eq!(outcome, expected, "wrong outcome for {reason:?}");
+                    assert!(reply.is_none(), "a Bye must not be answered with a Bye");
+                }
+                other => panic!("expected close for {reason:?}, got {other:?}"),
+            }
+            assert_eq!(s.phase(), PairingPhase::Burned, "for {reason:?}");
+        }
     }
 }

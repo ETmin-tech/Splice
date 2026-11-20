@@ -250,4 +250,22 @@ mod tests {
         );
         assert_eq!(format!("{resume:?}"), "[redacted]");
     }
+
+    #[test]
+    fn resume_key_is_the_documented_derivation_of_the_session_key() {
+        // The resume key is what a later session is authenticated with (§5.7), so
+        // it must be derived, not chosen: a constant would let anyone who saw one
+        // paste it resume as that device, and would make every pairing produce
+        // the same key.
+        let (key, _) = setup();
+        let expected = blake3::derive_key(RESUME_KEY_CONTEXT, key.expose_secret());
+        assert_eq!(*resume_key(&key).expose_secret(), expected);
+
+        let (other, _) = setup();
+        assert_ne!(*key.expose_secret(), *other.expose_secret());
+        assert_ne!(
+            *resume_key(&key).expose_secret(),
+            *resume_key(&other).expose_secret()
+        );
+    }
 }
