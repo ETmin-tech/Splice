@@ -190,6 +190,20 @@ mod tests {
     }
 
     #[test]
+    fn a_prompter_that_answers_yes_says_yes() {
+        // `AlwaysYes` is the test-only counterpart of `AlwaysNo`. If it ever
+        // returned `false`, every test that relies on it to grant consent would
+        // silently exercise the refusal path instead of the one it names.
+        let consent = AliasConsent::new("laptop", id()).unwrap();
+        assert!(AlwaysYes.confirm(&consent));
+        assert_ne!(
+            AlwaysNo.confirm(&consent),
+            AlwaysYes.confirm(&consent),
+            "the two built-in prompters must not agree"
+        );
+    }
+
+    #[test]
     fn both_sides_must_agree() {
         assert!(both_agree(true, true));
         assert!(!both_agree(true, false));

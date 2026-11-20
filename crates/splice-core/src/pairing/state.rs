@@ -151,6 +151,39 @@ mod tests {
     }
 
     #[test]
+    fn every_outcome_names_itself_for_the_log_line() {
+        // `Outcome::name` is what the CLI prints and what `is_terminal`'s
+        // assertion messages show. A mutant that returns "" or "xyzzy" makes
+        // every terminal outcome look identical in the log.
+        assert_eq!(Outcome::Paired.name(), "paired");
+        assert_eq!(Outcome::Failed.name(), "failed");
+        assert_eq!(Outcome::Burned.name(), "burned");
+        assert_eq!(Outcome::ProtocolViolation.name(), "protocol");
+        assert_eq!(Outcome::TimedOut.name(), "timed out");
+        assert_eq!(Outcome::Busy.name(), "busy");
+
+        // All six must be distinct, which is the property the caller relies on.
+        let names = [
+            Outcome::Paired,
+            Outcome::Failed,
+            Outcome::Burned,
+            Outcome::ProtocolViolation,
+            Outcome::TimedOut,
+            Outcome::Busy,
+        ]
+        .map(Outcome::name);
+        let mut sorted = names;
+        sorted.sort_unstable();
+        let mut deduped = sorted.to_vec();
+        deduped.dedup();
+        assert_eq!(
+            deduped.len(),
+            names.len(),
+            "outcome names collide: {names:?}"
+        );
+    }
+
+    #[test]
     fn only_the_host_claims_the_code_burned() {
         // `Burned` is a claim about the code; `Aborted` says only that this
         // exchange stopped. Both names are distinct so a log line or a caller
