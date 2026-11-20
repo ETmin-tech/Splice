@@ -474,12 +474,17 @@ mod tests {
     use rand::SeedableRng;
 
     fn session_on(mode: HelloMode) -> (HostSession, Code, NodeId, NodeId) {
+        session_at(mode, Instant::now())
+    }
+
+    /// Same, but pinned to a caller-supplied start time so the timers are exact.
+    fn session_at(mode: HelloMode, now: Instant) -> (HostSession, Code, NodeId, NodeId) {
         let host_id = NodeId::from_bytes([7u8; 32]);
         let guest_id = NodeId::from_bytes([9u8; 32]);
         let plate = Nameplate::new(42).unwrap();
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
         let code = Code::generate(&mut rng, WordCount::Two, plate).unwrap();
-        let session = HostSession::new(host_id, mode, code.clone(), Instant::now()).unwrap();
+        let session = HostSession::new(host_id, mode, code.clone(), now).unwrap();
         (session, code, host_id, guest_id)
     }
 
@@ -613,12 +618,20 @@ mod tests {
 
     #[test]
     fn debug_never_prints_the_words() {
-        let (s, code, _h, _g) = session_on(HelloMode::Pair);
+        let (s, code, host_id, _g) = session_on(HelloMode::Pair);
         let text = format!("{s:?}");
         let words = code.password().expose_secret().clone();
         for word in words.split('-') {
             assert!(!text.contains(word), "Debug leaked a word");
         }
+        // Redaction must not turn into silence: with all the fields dropped this
+        // text would still pass the loop above while telling a reader nothing.
+        assert!(text.contains("HostSession"), "Debug lost the type: {text}");
+        assert!(text.contains("phase"), "Debug lost the phase: {text}");
+        assert!(
+            text.contains(&host_id.prefix8()),
+            "Debug lost the host id: {text}"
+        );
     }
 
     #[test]
@@ -690,5 +703,163 @@ mod tests {
     fn an_empty_password_type_is_still_redacted() {
         let s = SecretString::from_string("x".to_string());
         assert_eq!(format!("{s:?}"), "[redacted]");
+    }
+
+    #[test]
+    fn a_code_session_exposes_its_code_and_a_ticket_session_does_not() {
+        // `code()` gates every caller that prints or stores the code, so a `None`
+        // that never becomes `Some` would silently hide the one value the user needs.
+        let (s, code, _h, _g) = session_on(HelloMode::OneShot);
+        let held = s.code().expect("a code session holds its code");
+        assert_eq!(
+            held.password().expose_secret(),
+            code.password().expose_secret()
+        );
+
+        let password = SecretString::from_string("ticket-secret".to_string());
+        let ticket = HostSession::new_with_password(
+            NodeId::from_bytes([3u8; 32]),
+            HelloMode::OneShot,
+            &password,
+            Instant::now(),
+        )
+        .unwrap();
+        assert!(ticket.code().is_none(), "ticket mode carries no code");
+    }
+
+    #[test]
+    fn next_timer_follows_the_deadline_then_the_ttl_then_stops() {
+        let now = Instant::now();
+        let (mut s, _code, _h, guest) = session_at(HelloMode::OneShot, now);
+
+        // Idle: the only thing pending is the code's own TTL.
+        assert_eq!(s.next_timer(now), Some(PAIRING_CODE_TTL));
+
+        // Mid-handshake the handshake deadline takes over, and it is shorter.
+        s.on_message(guest, hello(HelloMode::OneShot, 42), now)
+            .unwrap();
+        assert_eq!(
+            s.next_timer(now),
+            Some(HANDSHAKE_TIMEOUT),
+            "the armed deadline must win over the TTL"
+        );
+        assert_eq!(s.next_timer(now + HANDSHAKE_TIMEOUT), Some(Duration::ZERO));
+
+        // A burned code is terminal with no deadline armed: nothing is left to
+        // wait for, and reporting a TTL here would keep the caller's timer alive
+        // forever.
+        let (mut burned, _code, _h, _g) = session_at(HelloMode::OneShot, now);
+        assert_eq!(burned.expire(now + PAIRING_CODE_TTL), Some(Outcome::Burned));
+        assert_eq!(burned.phase(), PairingPhase::Burned);
+        assert_eq!(burned.deadline(), None, "expiry arms no deadline");
+        assert_eq!(burned.next_timer(now), None);
+    }
+
+    #[test]
+    fn the_ttl_timer_is_measured_from_creation_not_from_now() {
+        // A `created + TTL` that was really `now + TTL` would keep pushing the
+        // expiry back, and an unused code would never burn.
+        let now = Instant::now();
+        let (s, _code, _h, _g) = session_at(HelloMode::OneShot, now);
+        let later = now + Duration::from_secs(60);
+        assert_eq!(
+            s.next_timer(later),
+            Some(PAIRING_CODE_TTL - Duration::from_secs(60))
+        );
+        assert_eq!(
+            s.next_timer(now + PAIRING_CODE_TTL),
+            Some(Duration::ZERO),
+            "the timer must not go negative at the TTL"
+        );
+    }
+
+    #[test]
+    fn a_bye_from_the_guest_finishes_the_step_without_echoing_one() {
+        // The host never answers a `Bye` with a `Bye`: the peer already left, and
+        // replying would turn one clean shutdown into a message the peer cannot read.
+        let (mut s, _code, _h, guest) = session_on(HelloMode::OneShot);
+        let step = s
+            .on_message(
+                guest,
+                ControlMsg::Bye {
+                    reason: ByeReason::Normal,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(
+            step,
+            Step::ReplyThenClose {
+                reply: None,
+                outcome: Outcome::ProtocolViolation,
+            }
+        );
+    }
+
+    #[test]
+    fn a_replayed_guest_share_is_refused() {
+        // `peer_pake_msg` must already hold the first share: without that guard a
+        // second `PakeMsg` would try to drive a consumed SPAKE2 state.
+        let (mut s, code, host_id, guest) = session_on(HelloMode::OneShot);
+        let now = Instant::now();
+        s.on_message(guest, hello(HelloMode::OneShot, 42), now)
+            .unwrap();
+        let (_pake, guest_share) = PakeState::start(Role::Guest, &code.password(), guest, host_id);
+        let first = s
+            .on_message(
+                guest,
+                ControlMsg::PakeMsg {
+                    payload: guest_share.clone(),
+                },
+                now,
+            )
+            .unwrap();
+        assert!(matches!(first, Step::Reply(ControlMsg::PakeConfirm { .. })));
+
+        let replay = s
+            .on_message(
+                guest,
+                ControlMsg::PakeMsg {
+                    payload: guest_share,
+                },
+                now,
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                replay,
+                Step::ReplyThenClose {
+                    outcome: Outcome::ProtocolViolation,
+                    ..
+                }
+            ),
+            "a second share on one handshake must be refused, got {replay:?}"
+        );
+    }
+
+    #[test]
+    fn a_guest_mac_before_our_confirmation_is_refused() {
+        // `sent_confirm` guards the MAC check: accepting the peer's MAC first would
+        // let the guest learn whether its own MAC matched before proving anything.
+        let (mut s, code, host_id, guest) = session_on(HelloMode::OneShot);
+        let now = Instant::now();
+        s.on_message(guest, hello(HelloMode::OneShot, 42), now)
+            .unwrap();
+
+        let step = s
+            .on_message(guest, ControlMsg::PakeConfirm { mac: [0u8; 32] }, now)
+            .unwrap();
+        assert!(
+            matches!(
+                step,
+                Step::ReplyThenClose {
+                    outcome: Outcome::ProtocolViolation,
+                    ..
+                }
+            ),
+            "a MAC before we sent ours must be refused, got {step:?}"
+        );
+        assert_eq!(s.attempts_left(), PAIRING_ATTEMPTS_MAX);
+        let _ = (code, host_id);
     }
 }

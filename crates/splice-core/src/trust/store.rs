@@ -797,6 +797,68 @@ mod tests {
     }
 
     #[test]
+    fn an_over_long_alias_is_corrupt_but_the_cap_itself_is_accepted() {
+        // `into_entry`'s cap is `> ALIAS_MAX_LEN`, not `>=`: an alias of exactly
+        // the limit is legal (the sanitizer produces one) and must load.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(TRUST_FILE);
+        let at_cap = "a".repeat(ALIAS_MAX_LEN);
+        let text = format!(
+            r#"{{"version":1,"devices":[{{"node_id":"{}","alias":"{at_cap}","created_at":0,"last_seen":0,"auto_accept":false,"auto_accept_max_bytes":1}}]}}"#,
+            node()
+        );
+        write_store_file(&path, &text);
+        let store = TrustStore::load_in(dir.path()).expect("an alias at the cap is legal");
+        assert_eq!(store.entries()[0].alias.chars().count(), ALIAS_MAX_LEN);
+    }
+
+    #[test]
+    fn an_alias_past_the_cap_is_corrupt() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(TRUST_FILE);
+        let too_long = "a".repeat(ALIAS_MAX_LEN + 1);
+        let text = format!(
+            r#"{{"version":1,"devices":[{{"node_id":"{}","alias":"{too_long}","created_at":0,"last_seen":0,"auto_accept":false,"auto_accept_max_bytes":1}}]}}"#,
+            node()
+        );
+        write_store_file(&path, &text);
+        let err = TrustStore::load_in(dir.path()).unwrap_err();
+        assert!(matches!(err, Error::Trust(TrustError::Corrupt { .. })));
+    }
+
+    #[test]
+    fn a_directory_in_place_of_the_store_is_an_io_error_not_an_empty_store() {
+        // The `NotFound` guard must mean "first run" only. A path that exists but
+        // cannot be read is an error; reporting it as an empty store would let the
+        // next `add` silently replace whatever is there.
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join(TRUST_FILE)).unwrap();
+        let err = TrustStore::load_in(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, Error::Io(_)),
+            "an unreadable store must surface the io error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_loaded_store_is_not_empty_and_lists_its_entries() {
+        // `is_empty` is what `devices` and `listen` branch on; a hard `true` would
+        // tell a user with pinned devices that none are pinned.
+        let dir = TempDir::new().unwrap();
+        let mut store = open(&dir);
+        assert!(store.is_empty());
+        let id = add(&mut store, "laptop");
+        assert!(!store.is_empty());
+        assert_eq!(store.len(), 1);
+        assert!(store.contains(&id));
+        assert!(
+            !store.contains(&node()),
+            "an unpinned node must not read as pinned"
+        );
+        assert!(open(&dir).contains(&id));
+    }
+
+    #[test]
     fn a_control_character_in_the_file_is_corrupt() {
         // The neighbouring check the format-character one was added beside.
         let dir = TempDir::new().unwrap();

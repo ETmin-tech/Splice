@@ -254,6 +254,51 @@ mod tests {
     }
 
     #[test]
+    fn each_role_names_itself_and_its_own_side() {
+        // The name reaches logs and error text; the side tag reaches the wire.
+        // A wrong tag here would make both sides expect the same byte and every
+        // exchange would fail with `WrongRole`.
+        assert_eq!(Role::Guest.name(), "guest");
+        assert_eq!(Role::Host.name(), "host");
+
+        let (guest_id, host_id) = ids();
+        let (guest, guest_msg) = PakeState::start(Role::Guest, &password(), guest_id, host_id);
+        let (host, host_msg) = PakeState::start(Role::Host, &password(), guest_id, host_id);
+        assert_eq!(guest.side_tag(), SIDE_A);
+        assert_eq!(host.side_tag(), SIDE_B);
+        assert_eq!(guest_msg[0], SIDE_A);
+        assert_eq!(host_msg[0], SIDE_B);
+        assert_ne!(guest.side_tag(), host.side_tag());
+    }
+
+    #[test]
+    fn a_host_refuses_a_guest_share_and_vice_versa() {
+        // `check_message` must look at the peer's tag, not our own: accepting our
+        // own side would let an echo through `finish`.
+        let (guest_id, host_id) = ids();
+        let (guest, guest_msg) = PakeState::start(Role::Guest, &password(), guest_id, host_id);
+        let (_host, host_msg) = PakeState::start(Role::Host, &password(), guest_id, host_id);
+
+        assert!(matches!(
+            PakeState::check_message(Role::Host, &guest_msg),
+            Ok(())
+        ));
+        assert!(matches!(
+            PakeState::check_message(Role::Guest, &host_msg),
+            Ok(())
+        ));
+        assert!(matches!(
+            PakeState::check_message(Role::Host, &host_msg),
+            Err(crate::error::Error::Pairing(PairingError::WrongRole))
+        ));
+        assert!(matches!(
+            PakeState::check_message(Role::Guest, &guest_msg),
+            Err(crate::error::Error::Pairing(PairingError::WrongRole))
+        ));
+        let _ = guest;
+    }
+
+    #[test]
     fn debug_does_not_expose_the_key() {
         let (guest_id, host_id) = ids();
         let (guest, guest_msg) = PakeState::start(Role::Guest, &password(), guest_id, host_id);
