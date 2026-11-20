@@ -9,10 +9,24 @@
 /graphify-out/
 # cargo-mutants rewrites sources in place and leaves its results tree behind
 /mutants.out/
-/crates/splice-core/proptest-regressions/
+/mutants.out.old/
 
 # Local config and secrets that must never be committed
 *.key
 identity.key
 devices.json
 .env
+
+# Capture dan log
+*.pcap
+*.log
+
+# OS dan editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Dokumen kerja pribadi (bukan bagian repo)
+MasterPrompt-*.md
+Laporan-sementara.md
