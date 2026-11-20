@@ -433,7 +433,7 @@ impl HostSession {
                     None
                 }
             }
-            PairingPhase::Paired | PairingPhase::Burned => None,
+            PairingPhase::Paired | PairingPhase::Burned | PairingPhase::Aborted => None,
         }
     }
 

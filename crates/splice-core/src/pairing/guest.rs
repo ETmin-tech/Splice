@@ -258,7 +258,6 @@ impl GuestSession {
                 if verify_mac(Role::Host, key, &transcript, mac).is_err() {
                     // Wrong words, or a man in the middle. The guest cannot tell
                     // which, and must not try again (I3 is enforced on the host).
-                    self.abort();
                     return Ok(self.bye(Outcome::Failed));
                 }
                 self.phase = PairingPhase::Paired;
@@ -286,6 +285,12 @@ impl GuestSession {
                     _ => Outcome::Failed,
                 };
                 self.abort();
+                if *reason == ByeReason::Burned {
+                    // The host is the only authority on the counter and the expiry,
+                    // and this is it saying the code is gone. Adopt that verdict;
+                    // every other reason leaves the code's fate unknown.
+                    self.phase = PairingPhase::Burned;
+                }
                 Ok(Step::ReplyThenClose {
                     reply: None,
                     outcome,
@@ -336,9 +341,19 @@ impl GuestSession {
         if self.phase == PairingPhase::Paired {
             return;
         }
-        self.phase = PairingPhase::Burned;
+        // Terminal, but *not* `Burned`: this side stopped and learned nothing about
+        // the code. The caller reads the phase to decide what to tell the user, so
+        // claiming the device is dead here would be a lie. The one path that does
+        // know is a `Bye{Burned}` from the host, which sets it explicitly below.
+        self.phase = PairingPhase::Aborted;
         self.deadline = None;
         self.pake = None;
+        // The shares are as sensitive as the key: they are half of the transcript
+        // the MAC covers, and the host's `abort_handshake` clears its own for the
+        // same reason. Leaving them behind would keep a dead exchange alive in
+        // memory after `session_key` is dropped.
+        self.our_pake_msg.clear();
+        self.peer_pake_msg.clear();
         self.sent_confirm = false;
         self.session_key = None;
     }
@@ -519,6 +534,37 @@ mod tests {
     }
 
     #[test]
+    fn a_handshake_that_fails_does_not_claim_the_code_burned() {
+        // `Burned` means the *host* counted three wrong guesses (or the code
+        // expired). A guest that was refused, or that timed out, learned nothing
+        // about the code's fate: the host may be perfectly healthy. Reporting
+        // `Burned` here would tell the caller the device is dead when it is not.
+        let (mut s, _) = guest();
+        let step = s
+            .on_message(
+                ids().1,
+                ControlMsg::ConsentResult { granted: true },
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(matches!(step, Step::ReplyThenClose { .. }));
+        assert_ne!(
+            s.phase(),
+            PairingPhase::Burned,
+            "a protocol violation says nothing about the code"
+        );
+        assert!(!s.phase().advertises());
+
+        let (mut timed_out, _) = guest();
+        let start = Instant::now();
+        assert_eq!(
+            timed_out.on_timeout(start + HANDSHAKE_TIMEOUT),
+            Some(Outcome::TimedOut)
+        );
+        assert_ne!(timed_out.phase(), PairingPhase::Burned);
+    }
+
+    #[test]
     fn a_burned_host_ends_the_guest_without_retrying() {
         let (mut s, _) = guest();
         let step = s
@@ -558,7 +604,7 @@ mod tests {
             s.on_timeout(start + HANDSHAKE_TIMEOUT),
             Some(Outcome::TimedOut)
         );
-        assert_eq!(s.phase(), PairingPhase::Burned);
+        assert_eq!(s.phase(), PairingPhase::Aborted, "a timeout burns nothing");
     }
 
     #[test]
@@ -625,7 +671,11 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(s.phase(), PairingPhase::Burned);
+        assert_eq!(
+            s.phase(),
+            PairingPhase::Aborted,
+            "a late reply burns nothing"
+        );
     }
 
     #[test]
@@ -666,7 +716,14 @@ mod tests {
                 }
                 other => panic!("expected close for {reason:?}, got {other:?}"),
             }
-            assert_eq!(s.phase(), PairingPhase::Burned, "for {reason:?}");
+            let expected_phase = if reason == ByeReason::Burned {
+                // The host's verdict: the code is gone.
+                PairingPhase::Burned
+            } else {
+                // Any other `Bye` says nothing about the code itself.
+                PairingPhase::Aborted
+            };
+            assert_eq!(s.phase(), expected_phase, "for {reason:?}");
         }
     }
 }

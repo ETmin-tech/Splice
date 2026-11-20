@@ -330,7 +330,7 @@ fn i2_a_guest_refuses_every_early_application_message() {
             "{} was accepted before confirmation",
             message.name()
         );
-        assert_eq!(guest.phase(), PairingPhase::Burned);
+        assert_eq!(guest.phase(), PairingPhase::Aborted);
     }
 }
 
@@ -585,7 +585,7 @@ fn mitm_a_a_verbatim_relay_between_two_node_ids_fails_both_confirmations() {
     }
 
     assert_eq!(host.phase(), PairingPhase::WaitingForGuest);
-    assert_eq!(guest.phase(), PairingPhase::Burned);
+    assert_eq!(guest.phase(), PairingPhase::Aborted);
     assert!(host.session_key().is_none());
     assert!(guest.session_key().is_none());
     // The code survives: a wrong guess costs one attempt, not the code.
@@ -1012,8 +1012,12 @@ fn a_bye_from_the_host_ends_the_guest_for_good() {
     ));
     assert_eq!(
         guest.phase(),
-        PairingPhase::Burned,
+        PairingPhase::Aborted,
         "a refused guest must not be reusable"
+    );
+    assert!(
+        !guest.phase().advertises(),
+        "an aborted guest must not keep an advertisement"
     );
     // A late message cannot revive it.
     let step = guest

@@ -15,7 +15,19 @@ pub enum PairingPhase {
     /// Key confirmation succeeded. The code is spent.
     Paired,
     /// Three failures, or the code expired. Terminal.
+    ///
+    /// This is a statement about the *code*, not about this connection: only the
+    /// host can reach it, because only the host counts attempts and holds the
+    /// expiry. A guest adopts it when the host says so (`Bye{Burned}`).
     Burned,
+    /// This exchange ended and nothing vouched for the code's fate.
+    ///
+    /// A protocol violation, a handshake timeout, a refused attempt, or a
+    /// guest-side token mismatch in ticket mode. The host may be perfectly
+    /// healthy and the code may still pair someone else, so reporting `Burned`
+    /// here would tell the caller a device is dead when it is not. Terminal for
+    /// this session, and never advertises.
+    Aborted,
 }
 
 impl PairingPhase {
@@ -25,6 +37,7 @@ impl PairingPhase {
             Self::Pairing => "pairing",
             Self::Paired => "paired",
             Self::Burned => "burned",
+            Self::Aborted => "aborted",
         }
     }
 
@@ -134,5 +147,16 @@ mod tests {
         assert!(PairingPhase::Pairing.advertises());
         assert!(!PairingPhase::Paired.advertises());
         assert!(!PairingPhase::Burned.advertises());
+        assert!(!PairingPhase::Aborted.advertises());
+    }
+
+    #[test]
+    fn only_the_host_claims_the_code_burned() {
+        // `Burned` is a claim about the code; `Aborted` says only that this
+        // exchange stopped. Both names are distinct so a log line or a caller
+        // cannot confuse them.
+        assert_eq!(PairingPhase::Burned.name(), "burned");
+        assert_eq!(PairingPhase::Aborted.name(), "aborted");
+        assert_ne!(PairingPhase::Burned, PairingPhase::Aborted);
     }
 }
