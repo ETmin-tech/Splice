@@ -125,6 +125,15 @@ async fn accept_loop(
             }
         }
 
+        // §5.4 step 7: a burned code is terminal. The advertisement must come down
+        // and no further guest may be asked for it — the state machine refuses them
+        // anyway, but looping would keep the socket answering for the rest of the
+        // TTL and keep the mDNS record up.
+        if host.phase() == PairingPhase::Burned {
+            println!("🚫 Kode hangus");
+            return Err(anyhow!("kode hangus"));
+        }
+
         // Wake up at the next state-machine deadline, but never longer than the
         // code TTL, so expiry is noticed promptly.
         let timer = host.next_timer(now).unwrap_or(PAIRING_CODE_TTL);
@@ -448,7 +457,8 @@ async fn resolve_host(cli: &Cli, code: &Code) -> Result<NodeAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use splice_core::pairing::AliasConsent;
+    use splice_core::net::memory::Network;
+    use splice_core::pairing::{AliasConsent, AlwaysYes};
     use tempfile::TempDir;
 
     fn id(seed: u8) -> NodeId {
@@ -459,6 +469,104 @@ mod tests {
             *byte = seed.wrapping_add(i as u8);
         }
         NodeId::from_bytes(bytes)
+    }
+
+    /// §5.4 step 7: once the code is BURNED, no further guest may reach it.
+    ///
+    /// The loop, not the state machine, keeps accepting connections, so a burned
+    /// host that keeps looping still advertises and still answers `Hello`s for the
+    /// rest of the TTL. This drives the real `accept_loop` with a burned session
+    /// and asserts it stops instead of looping.
+    #[tokio::test]
+    async fn a_burned_code_stops_the_accept_loop() {
+        let net = Network::new();
+        let host_id = id(0x71);
+        let host_ep = net.endpoint_with(host_id, false);
+
+        let nameplate = splice_core::code::Nameplate::new(9).expect("nameplate");
+        let mut rng = rand::rng();
+        let the_code =
+            Code::generate(&mut rng, splice_core::code::WordCount::Two, nameplate).expect("code");
+        let mut host = HostSession::new(host_id, HelloMode::Pair, the_code.clone(), Instant::now())
+            .expect("host session");
+
+        // Drive it to BURNED exactly the way a guest with the wrong code does,
+        // without the network: a wrong guess must reach key confirmation, so the
+        // round is `Hello` -> `PakeMsg` -> a `PakeConfirm` that cannot verify. The
+        // point under test is what `accept_loop` does *next*.
+        let wrong = splice_core::secret::SecretString::from_string("not-the-real-code".to_string());
+        for _ in 0..3 {
+            let guest = id(0x80);
+            let (mut pake, our_msg) = splice_core::pairing::PakeState::start(
+                splice_core::pairing::Role::Guest,
+                &wrong,
+                guest,
+                host_id,
+            );
+            let step = host
+                .on_message(
+                    guest,
+                    ControlMsg::Hello {
+                        version: splice_core::constants::PROTOCOL_VERSION,
+                        mode: HelloMode::Pair,
+                        nameplate: Some(nameplate.get()),
+                        resume: None,
+                    },
+                    Instant::now(),
+                )
+                .expect("hello");
+            // The host shares its PAKE message as soon as it accepts the `Hello`.
+            let host_msg = match step {
+                splice_core::pairing::Step::Reply(ControlMsg::PakeMsg { payload }) => payload,
+                other => panic!("expected the host share, got {other:?}"),
+            };
+            let step = host
+                .on_message(
+                    guest,
+                    ControlMsg::PakeMsg { payload: our_msg },
+                    Instant::now(),
+                )
+                .expect("pake msg");
+            assert!(
+                matches!(
+                    step,
+                    splice_core::pairing::Step::Reply(ControlMsg::PakeConfirm { .. })
+                ),
+                "the host confirms first, got {step:?}"
+            );
+            // The two sides derive different keys, so this MAC cannot verify.
+            let _ = pake.finish(&host_msg);
+            let step = host
+                .on_message(
+                    guest,
+                    ControlMsg::PakeConfirm { mac: [0u8; 32] },
+                    Instant::now(),
+                )
+                .expect("confirm");
+            assert!(
+                matches!(step, splice_core::pairing::Step::ReplyThenClose { .. }),
+                "a wrong MAC must end the attempt"
+            );
+        }
+        assert_eq!(host.phase(), PairingPhase::Burned, "precondition");
+
+        let dir = TempDir::new().expect("temp dir");
+        let mut store = TrustStore::load_in(dir.path()).expect("store");
+        let prompter = AlwaysYes;
+
+        // No guest is ever dialed: if the loop is still accepting, this await
+        // blocks until the test times out. A passing run returns promptly.
+        let loop_result = timeout(
+            Duration::from_millis(400),
+            accept_loop(&mut host, &host_ep, &prompter, &mut store, host_id),
+        )
+        .await;
+
+        let returned = loop_result.expect("a burned code must end the accept loop");
+        assert!(
+            returned.is_err(),
+            "a burned code is a terminal failure, not a success"
+        );
     }
 
     /// `TrustExchange` names the *sender*. The name must come from our own id, so
