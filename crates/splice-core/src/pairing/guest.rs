@@ -182,7 +182,16 @@ impl GuestSession {
     }
 
     /// The session key, valid only after the host's MAC verified.
+    ///
+    /// The SPAKE2 output exists as soon as the host's share arrives, because our own
+    /// confirmation MAC is computed from it (see the private `session_key_ref`). It
+    /// is not *readable* until then: a wrong guess derives a different key, and a
+    /// man in the middle relaying two SPAKE2 runs has a key of its own that the
+    /// host's MAC has not yet vouched for.
     pub fn session_key(&self) -> Option<&Secret<[u8; 32]>> {
+        if self.phase != PairingPhase::Paired {
+            return None;
+        }
         self.session_key.as_ref()
     }
 
@@ -458,6 +467,36 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn the_key_is_held_back_until_the_host_mac_verifies() {
+        let (mut s, _opening) = guest();
+        let (self_id, host_id) = ids();
+        let (_host_pake, host_share) =
+            PakeState::start(Role::Host, &code().password(), self_id, host_id);
+
+        let step = s
+            .on_message(
+                host_id,
+                ControlMsg::PakeMsg {
+                    payload: host_share,
+                },
+                Instant::now(),
+            )
+            .unwrap();
+        assert!(
+            matches!(step, Step::Reply(ControlMsg::PakeConfirm { .. })),
+            "the guest answers with its own confirmation, got {step:?}"
+        );
+        // We needed the key to compute that MAC, but the host's MAC has not been
+        // seen yet, so the exchange is still unauthenticated: a man in the middle
+        // who relayed two independent SPAKE2 runs would look exactly like this.
+        assert!(
+            s.session_key().is_none(),
+            "the key must not be readable before the host's MAC verified"
+        );
+        assert_eq!(s.phase(), PairingPhase::Pairing);
     }
 
     #[test]

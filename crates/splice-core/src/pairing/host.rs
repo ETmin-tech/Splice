@@ -437,8 +437,17 @@ impl HostSession {
         }
     }
 
-    /// The session key, valid only after both MACs verified.
+    /// The session key, valid only after the guest's MAC verified.
+    ///
+    /// The SPAKE2 output exists as soon as the guest's share arrives, because our
+    /// own confirmation MAC is computed from it (see the private `session_key_ref`).
+    /// It is not *readable* until then: before the peer's MAC verifies it proves
+    /// nothing — a man in the middle relaying two independent SPAKE2 runs holds a
+    /// perfectly good key of its own, and a wrong guess derives a different one.
     pub fn session_key(&self) -> Option<&crate::secret::Secret<[u8; 32]>> {
+        if self.phase != PairingPhase::Paired {
+            return None;
+        }
         self.session_key.as_ref()
     }
 
@@ -606,6 +615,40 @@ mod tests {
         s.on_message(guest, hello(HelloMode::OneShot, 42), Instant::now())
             .unwrap();
         assert!(s.session_key().is_none());
+    }
+
+    #[test]
+    fn the_key_is_held_back_until_the_guest_mac_verifies() {
+        let (mut s, code, host_id, guest) = session_on(HelloMode::OneShot);
+        let now = Instant::now();
+        let step = s
+            .on_message(guest, hello(HelloMode::OneShot, 42), now)
+            .unwrap();
+        assert!(matches!(step, Step::Reply(ControlMsg::PakeMsg { .. })));
+
+        // The guest's share arrives: SPAKE2 yields a key, which the host needs for
+        // its own MAC. That is not yet proof of anything — a guest who guessed
+        // wrong derives a *different* key and its MAC will not verify.
+        let (_pake, guest_share) = PakeState::start(Role::Guest, &code.password(), guest, host_id);
+        let step = s
+            .on_message(
+                guest,
+                ControlMsg::PakeMsg {
+                    payload: guest_share,
+                },
+                now,
+            )
+            .unwrap();
+        assert!(
+            matches!(step, Step::Reply(ControlMsg::PakeConfirm { .. })),
+            "the unverified stage still produces our confirmation, got {step:?}"
+        );
+        assert!(
+            s.session_key().is_none(),
+            "the key must not be readable before the guest's MAC verified"
+        );
+
+        assert_eq!(s.phase(), PairingPhase::Pairing);
     }
 
     #[test]
