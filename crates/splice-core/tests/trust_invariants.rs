@@ -30,6 +30,20 @@ fn id() -> NodeId {
     NodeSecret::generate().public()
 }
 
+/// Write a store file the way the loader expects to find it: owner-only.
+///
+/// A plain `fs::write` inherits the umask, which on Linux is `0022`, so the file
+/// lands `0644` and `TrustStore::load_in` stops at the permission check before it
+/// can ever report the corruption under test.
+fn write_store_file(path: &std::path::Path, bytes: impl AsRef<[u8]>) {
+    std::fs::write(path, bytes).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
 async fn write_control(tx: &mut SendStream, message: &ControlMsg) -> Result<(), String> {
     let bytes = Frame::control(message)
         .map_err(|err| err.to_string())?
@@ -211,7 +225,7 @@ async fn removing_a_device_hangs_up_its_live_connection() {
 async fn a_corrupt_store_keeps_a_backup_and_trusts_nobody() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("trust.json");
-    std::fs::write(&path, b"{ this is not json").unwrap();
+    write_store_file(&path, b"{ this is not json");
 
     let err = TrustStore::load_in(dir.path()).expect_err("corruption must be reported");
     let text = err.to_string();

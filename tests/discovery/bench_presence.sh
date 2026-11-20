@@ -30,7 +30,7 @@
 #   SPLICE_BIN         release binary (default /root/splice-target/release/splice)
 #   SPLICE_RELAY_MODE  passed to pair/listen (default: disabled)
 #   SPLICE_RUNS        number of runs (default 32; Step 12 needs >= 30)
-#   SPLICE_WORK        scratch root (default /root/splice-discovery)
+#   SPLICE_WORK        scratch root (default $RUNNER_TEMP/splice-discovery, else /tmp)
 #   SPLICE_OUT         artifact dir (default $SPLICE_WORK/out)
 set -uo pipefail
 
@@ -38,7 +38,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 BIN=${SPLICE_BIN:-/root/splice-target/release/splice}
 MODE=${SPLICE_RELAY_MODE:-disabled}
 RUNS=${SPLICE_RUNS:-32}
-WORK=${SPLICE_WORK:-/root/splice-discovery}
+WORK=${SPLICE_WORK:-${RUNNER_TEMP:-/tmp}/splice-discovery}
 OUT=${SPLICE_OUT:-$WORK/out}
 NS_A=splice-a
 NS_B=splice-b
@@ -283,6 +283,12 @@ fi
 
 say "result"
 printf 'venue=netns relay_mode=%s runs=%d pass=%d fail=%d\n' \
-  "$MODE" "$DONE" "$PASS" "$FAIL"
+  "$MODE" "$DONE" "$PASS" "$FAIL" | tee "$OUT/result.txt"
+
+# The script runs as root (ip netns); hand the artifacts back to the runner user.
+if [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
+  chown -R "$SUDO_UID:$SUDO_GID" "$WORK" 2>/dev/null || true
+fi
+
 [ "$FAIL" -eq 0 ] || exit 1
 echo "DISCOVERY_BENCH_OK"

@@ -52,7 +52,7 @@ jobs:
       # the default config location; every other case passes an explicit temp dir
       # to `load_in`. So the default `cargo test` parallel schedule is safe here.
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --no-fail-fast
         env:
           RUST_BACKTRACE: "1"
 

@@ -39,12 +39,14 @@ jobs:
         env:
           SPLICE_BIN: ${{ github.workspace }}/target/release/splice
           SPLICE_RELAY_MODE: ${{ matrix.relay-mode }}
-        run: sudo --preserve-env=SPLICE_BIN,SPLICE_RELAY_MODE bash tests/offline/offline_test.sh
+          SPLICE_WORK: ${{ runner.temp }}/splice-offline
+          SPLICE_OUT: ${{ runner.temp }}/splice-offline/out
+        run: sudo --preserve-env=SPLICE_BIN,SPLICE_RELAY_MODE,SPLICE_WORK,SPLICE_OUT,SUDO_UID,SUDO_GID bash tests/offline/offline_test.sh
 
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: offline-logs-${{ matrix.relay-mode }}
-          path: /root/splice-offline/out
+          path: ${{ runner.temp }}/splice-offline/out
           if-no-files-found: ignore

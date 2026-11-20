@@ -1,6 +1,6 @@
 //! The 2048-word list used by pairing codes (§5.2).
 //!
-//! Source: the English BIP-39 word list (CC0-1.0, https://github.com/bitcoin/bips),
+//! Source: the English BIP-39 word list (CC0-1.0, <https://github.com/bitcoin/bips>),
 //! vendored verbatim rather than depending on the `bip39` crate for one static array.
 //! Properties asserted by the tests in `super`: exactly 2048 words, lowercase ASCII,
 //! no duplicates, and a unique 4-letter prefix per word so a code can be autocompleted

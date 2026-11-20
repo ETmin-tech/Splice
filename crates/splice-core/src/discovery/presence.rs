@@ -21,7 +21,8 @@
 //! and +1, so a clock difference of up to five minutes still matches.
 //!
 //! The beacon carries the sender's iroh UDP port; the source IP of the datagram
-//! supplies the address, so a matched beacon yields a complete [`NodeAddr`] hint.
+//! supplies the address, so a matched beacon yields a complete
+//! [`crate::net::NodeAddr`] hint.
 //! A forged beacon only produces a dial that TLS rejects.
 
 use std::collections::HashMap;
@@ -352,6 +353,10 @@ impl PresenceTracker {
 pub struct PresenceSocket {
     socket: tokio::net::UdpSocket,
     group: std::net::Ipv4Addr,
+    /// The IPv4 interface joined for sending, or `0.0.0.0` for the kernel's
+    /// choice. Kept for diagnostics: a bind that succeeds but joins nothing here
+    /// is the failure mode the tests report.
+    egress: std::net::Ipv4Addr,
 }
 
 impl std::fmt::Debug for PresenceSocket {
@@ -359,6 +364,7 @@ impl std::fmt::Debug for PresenceSocket {
         f.debug_struct("PresenceSocket")
             .field("port", &self.port())
             .field("group", &self.group)
+            .field("egress", &self.egress)
             .finish()
     }
 }
@@ -379,20 +385,40 @@ impl PresenceSocket {
         socket
             .set_reuse_address(true)
             .map_err(|err| DiscoveryError::PresenceSocket(err.to_string()))?;
+        // `SO_REUSEADDR` alone lets two sockets share a UDP port on Linux, but on
+        // the BSDs (macOS included) it does not: the second `bind` fails with
+        // `EADDRINUSE`. Several processes on one host must be able to listen
+        // (and the send test opens two sockets on `PRESENCE_PORT`), so ask for
+        // `SO_REUSEPORT` too. It is best-effort: the option does not exist on
+        // every platform and its absence only matters where it is required.
+        #[cfg(unix)]
+        {
+            let _ = socket.set_reuse_port(true);
+        }
+        // Our own beacon must come back to us: on a host that is the only
+        // listener, and in the send test where sender and receiver share the
+        // port, delivery relies on the multicast loopback. The option defaults
+        // on, but it is set explicitly so a platform default cannot silently
+        // change the receive path this test measures.
+        let _ = socket.set_multicast_loop_v4(true);
         socket
             .set_nonblocking(true)
             .map_err(|err| DiscoveryError::PresenceSocket(err.to_string()))?;
         socket
             .bind(&SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port).into())
             .map_err(|err| {
-                DiscoveryError::MulticastUnavailable(format!("cannot bind UDP port {port}: {err}"))
+                DiscoveryError::MulticastUnavailable(format!(
+                    "cannot bind UDP port {port}: {err}{}",
+                    interface_context()
+                ))
             })?;
 
         let group = PRESENCE_GROUP_V4;
         let egress = join_on_all_interfaces(&socket, group);
         let Some(egress) = egress else {
             return Err(DiscoveryError::MulticastUnavailable(format!(
-                "cannot join {group} on any IPv4 interface"
+                "cannot join {group} on any IPv4 interface{}",
+                interface_context()
             ))
             .into());
         };
@@ -405,7 +431,11 @@ impl PresenceSocket {
         let _ = socket.set_multicast_if_v4(&egress);
         let socket = tokio::net::UdpSocket::from_std(socket.into())
             .map_err(|err| DiscoveryError::PresenceSocket(err.to_string()))?;
-        Ok(Self { socket, group })
+        Ok(Self {
+            socket,
+            group,
+            egress,
+        })
     }
 
     /// The bound port (useful when the caller passed 0 in a test).
@@ -418,6 +448,13 @@ impl PresenceSocket {
 
     pub fn group(&self) -> Ipv4Addr {
         self.group
+    }
+
+    /// The interface used as the multicast egress, or `0.0.0.0` for the kernel's
+    /// choice. Exposed so a failed receive can name the interface it should have
+    /// arrived on.
+    pub fn egress(&self) -> Ipv4Addr {
+        self.egress
     }
 
     /// Broadcast one beacon.
@@ -488,6 +525,28 @@ fn join_on_all_interfaces(socket: &socket2::Socket, group: Ipv4Addr) -> Option<I
 /// interface's normal address anyway.
 fn usable_multicast_interface(addr: Ipv4Addr) -> bool {
     !addr.is_loopback() && !addr.is_link_local()
+}
+
+/// Enumerate the host's IPv4 interfaces for an error message.
+///
+/// A multicast failure is almost always a *host* property (no usable interface,
+/// client isolation), not a bug in this file, so the message must carry the
+/// evidence to tell the two apart on a machine we cannot log into.
+fn interface_context() -> String {
+    match if_addrs::get_if_addrs() {
+        Ok(interfaces) => {
+            let mut listed = Vec::new();
+            for interface in interfaces {
+                listed.push(format!("{}={}", interface.name, interface.ip()));
+            }
+            if listed.is_empty() {
+                " (no interfaces enumerated)".to_string()
+            } else {
+                format!(" (interfaces: {})", listed.join(", "))
+            }
+        }
+        Err(err) => format!(" (interface enumeration failed: {err})"),
+    }
 }
 
 /// The first candidate for which `join` succeeds, in input order.
@@ -953,8 +1012,30 @@ mod tests {
     /// without transmitting leaves the receiver empty.
     #[tokio::test]
     async fn send_actually_transmits_a_beacon() {
-        let receiver = PresenceSocket::bind(PRESENCE_PORT).expect("bind the receiver");
-        let sender = PresenceSocket::bind(PRESENCE_PORT).expect("bind the sender");
+        // Two sockets must share one UDP port. `PRESENCE_PORT` is the real port,
+        // but a stale listener (another test binary, a running daemon) would make
+        // the second bind fail for a reason unrelated to this test, so fall back
+        // to a free ephemeral port: the two sockets only have to agree with each
+        // other, not with the production value.
+        let receiver = match PresenceSocket::bind(PRESENCE_PORT) {
+            Ok(socket) => socket,
+            Err(err) => {
+                eprintln!(
+                    "note: cannot bind PRESENCE_PORT {PRESENCE_PORT} ({err}); \
+                     falling back to an ephemeral port"
+                );
+                PresenceSocket::bind(0).expect("bind an ephemeral presence port")
+            }
+        };
+        let port = receiver.port();
+        let sender = PresenceSocket::bind(port).unwrap_or_else(|err| {
+            panic!(
+                "cannot bind a second socket on port {port} \
+                 (receiver egress {}, receiver group {}): {err}",
+                receiver.egress(),
+                receiver.group()
+            )
+        });
         let beacon = Beacon {
             tag: tag_for(node(0x5a), bucket_at(Duration::from_secs(0))),
             port: sender.port(),
@@ -962,13 +1043,20 @@ mod tests {
 
         sender.send(&beacon).await.expect("send a beacon");
 
-        let (buffer, len, _from) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
-            .await
-            .expect("a beacon must arrive before the timeout")
-            .expect("recv must not fail");
-        assert_eq!(
-            Beacon::decode(&buffer[..len]).map(|b| b.port),
-            Some(beacon.port)
-        );
+        match tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await {
+            Ok(Ok((buffer, len, _from))) => assert_eq!(
+                Beacon::decode(&buffer[..len]).map(|b| b.port),
+                Some(beacon.port)
+            ),
+            Ok(Err(err)) => panic!("recv failed: {err}"),
+            Err(_) => panic!(
+                "no beacon within 5 s; receiver egress {}, sender egress {}, \
+                 receiver port {port}, group {}{}",
+                receiver.egress(),
+                sender.egress(),
+                receiver.group(),
+                interface_context()
+            ),
+        }
     }
 }

@@ -24,13 +24,14 @@
 # Env:
 #   SPLICE_BIN         release binary (default /root/splice-target/release/splice)
 #   SPLICE_RELAY_MODE  `disabled` or `default` (default: disabled)
-#   SPLICE_OUT         artifact dir (default /root/splice-offline/out)
+#   SPLICE_WORK        scratch root (default $RUNNER_TEMP/splice-offline, else /tmp)
+#   SPLICE_OUT         artifact dir (default $SPLICE_WORK/out)
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 BIN=${SPLICE_BIN:-/root/splice-target/release/splice}
 MODE=${SPLICE_RELAY_MODE:-disabled}
-WORK=${SPLICE_WORK:-/root/splice-offline}
+WORK=${SPLICE_WORK:-${RUNNER_TEMP:-/tmp}/splice-offline}
 OUT=${SPLICE_OUT:-$WORK/out}
 NS_A=splice-a
 NS_B=splice-b
@@ -209,6 +210,14 @@ if [ -z "$LEFT" ]; then ok "no splice process outlived the run"; else
 fi
 
 say "result"
-printf 'relay_mode=%s pass=%d fail=%d\n' "$MODE" "$PASS" "$FAIL"
+printf 'relay_mode=%s pass=%d fail=%d\n' "$MODE" "$PASS" "$FAIL" | tee "$OUT/result.txt"
+
+# The script runs as root (ip netns), but the runner user uploads the artifacts.
+# Hand the tree back so `actions/upload-artifact` can read it; without this the
+# upload step fails with EACCES on the ambient dir.
+if [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
+  chown -R "$SUDO_UID:$SUDO_GID" "$WORK" 2>/dev/null || true
+fi
+
 [ "$FAIL" -eq 0 ] || exit 1
 echo "OFFLINE_OK"

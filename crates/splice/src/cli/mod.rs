@@ -236,7 +236,7 @@ pub async fn read_control(
 const LINGER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Read (and discard) until the peer hangs up, so our own close cannot cut off
-/// the frame we just wrote. Bounded by [`LINGER_TIMEOUT`], and never an error:
+/// the frame we just wrote. Bounded by `LINGER_TIMEOUT`, and never an error:
 /// a peer that lingers or vanishes both end the wait.
 pub async fn await_peer_hangup(rx: &mut splice_core::net::RecvStream) {
     use tokio::io::AsyncReadExt;

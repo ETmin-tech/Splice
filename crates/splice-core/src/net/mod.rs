@@ -1,7 +1,7 @@
 //! Transport boundary (§6, §7.1).
 //!
 //! Everything above this module speaks [`Transport`] and [`Connection`]; only
-//! [`iroh_impl`] mentions iroh. That keeps the S1 decision reversible: a different
+//! the private `iroh_impl` module mentions iroh. That keeps the S1 decision reversible: a different
 //! QUIC stack would be a new module, not a rewrite.
 //!
 //! Three things are deliberately *not* hidden here: the peer [`NodeId`] (authenticated
