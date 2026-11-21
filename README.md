@@ -160,6 +160,7 @@ Semua perintah dijalankan dari akar repo.
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo test --workspace
 cargo deny check
 cargo audit
@@ -224,6 +225,7 @@ Model ancaman lengkap: [`docs/Architecture.md`](docs/Architecture.md) bagian 13.
 
 - **Belum ditinjau pihak luar.** Hanya ada tinjauan internal dan pengujian otomatis.
 - **Belum diukur di Wi-Fi nyata dan dua mesin fisik.** Pengukuran sejauh ini memakai network namespace dan loopback.
+- **Izin Local Network macOS belum diverifikasi di Mac fisik.** macOS Sequoia (15+) mewajibkan izin dialog Local Network untuk lalu lintas broadcast/multicast LAN; perilaku izin ini baru diuji di CI virtual (runner GitHub Actions) dan belum diverifikasi langsung di Mac fisik.
 - Wi-Fi dengan *client isolation* **dan** tanpa internet tidak didukung. Gunakan hotspot HP.
 - Pengamat di jaringan yang sama bisa tahu bahwa ada perangkat Splice dan kapan aktif (isi dan identitas tidak terbaca).
 - Rahasia di memori di-zeroize di sisi kode kita, tetapi salinan di dalam pustaka `spake2` di luar kendali kita.
@@ -231,7 +233,7 @@ Model ancaman lengkap: [`docs/Architecture.md`](docs/Architecture.md) bagian 13.
 
 ## Kontribusi
 
-Sebelum membuka pull request, pastikan lima gerbang di bagian [Pengujian](#pengujian) lulus. Perubahan pada `pairing/` atau `trust/` wajib disertai tes yang **gagal lebih dulu** terhadap kode lama. Detail desain dan invarian keamanan ada di [`docs/Architecture.md`](docs/Architecture.md).
+Sebelum membuka pull request, pastikan enam gerbang di bagian [Pengujian](#pengujian) lulus. Perubahan pada `pairing/` atau `trust/` wajib disertai tes yang **gagal lebih dulu** terhadap kode lama. Detail desain dan invarian keamanan ada di [`docs/Architecture.md`](docs/Architecture.md).
 
 ## Lisensi
 

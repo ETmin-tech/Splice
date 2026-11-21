@@ -5,7 +5,7 @@
 //! sp1-<base32 of postcard{TicketBody}>
 //! ```
 //!
-//! `TicketBody` holds the iroh [`crate::net::NodeAddr`] (NodeId plus any direct and
+//! `TicketBody` holds the NodeAddr (NodeId plus any direct and
 //! relay hints) and a 128-bit CSPRNG secret. The secret *is* the SPAKE2 password in
 //! ticket mode, so the ticket string is a secret: it must never be logged and must
 //! be handled through [`SecretString`] once it leaves this module.

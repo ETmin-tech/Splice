@@ -72,6 +72,21 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
 
+      - name: Per-target test summary
+        if: always()
+        shell: bash
+        run: |
+          echo "=== Per-target test results (${{ matrix.os }}) ==="
+          grep -E "(Running |Doc-tests |test result:)" test-output.txt || cat test-output.txt
+          if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+            {
+              echo "### Per-target test results (${{ matrix.os }})"
+              echo '```'
+              grep -E "(Running |Doc-tests |test result:)" test-output.txt || cat test-output.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Test failure digest
         if: failure()
         shell: bash

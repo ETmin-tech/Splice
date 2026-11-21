@@ -9,7 +9,7 @@
 //!   `--addr` needs.
 //!
 //! The second form is an addition to the architecture text, which only shows
-//! `--addr 192.168.x.x:port`. It exists because iroh authenticates the responder
+//! `--addr 192.168.x.x:port`. It exists because the transport authenticates the responder
 //! by public key: there is no dial-by-IP-without-identity call. The deviation is
 //! recorded in `Laporan-1.md` §10 (ambiguities).
 

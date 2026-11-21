@@ -9,8 +9,7 @@
 //! 4. [`presence`] — rotating keyed tags that tell us which *already trusted*
 //!    devices are online, without revealing who they are to the rest of the LAN.
 //!
-//! Nothing here talks to iroh: each module produces a [`crate::net::NodeAddr`]
-//! hint and calls `splice-core`'s own transport.
+//! Each module produces a NodeAddr hint and calls `splice-core`'s own transport.
 
 pub mod manual;
 pub mod mdns;

@@ -5,9 +5,9 @@
 //! withdrawn as soon as the session reaches PAIRED or BURNED, so the advertisement
 //! only ever exposes a *live* code's nameplate.
 //!
-//! # Why our own schema instead of iroh's built-in mDNS
+//! # Why our own schema instead of generic built-in mDNS
 //!
-//! Spike S1 measured both. The built-in discovery announces an instance label
+//! Spike S1 measured both. Generic built-in discovery announces an instance label
 //! that is `base32(endpoint_id)`, which any LAN observer decodes back to the real
 //! NodeId (confirmed by packet capture, `LABEL_IS_NODEID: True`), and its
 //! implementation returned `Network is unreachable (os error 101)` inside an
@@ -61,7 +61,7 @@ pub struct AdvertisedHost {
 }
 
 impl AdvertisedHost {
-    /// A [`crate::net::NodeAddr`] with every dialable address the advertiser
+    /// A NodeAddr with every dialable address the advertiser
     /// published, or `None` when none of them is reachable.
     ///
     /// A multi-homed host publishes one A/AAAA record per address, and
@@ -211,7 +211,7 @@ impl Mdns {
 
     /// Advertise a live pairing code.
     ///
-    /// `port` is the iroh UDP port the guest should dial; the address records are
+    /// `port` is the transport UDP port the guest should dial; the address records are
     /// filled in by the daemon from the host's interfaces (`enable_addr_auto`), so
     /// a DHCP-renewed address does not require re-registering.
     pub fn advertise(&self, nameplate: u16, node: NodeId, port: u16) -> Result<AdvertisedHost> {

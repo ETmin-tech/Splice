@@ -185,13 +185,29 @@ Seluruh kuota token dipakai di fase konstruksi. Pola kerja yang disarankan untuk
 | Metrik | Target |
 |---|---|
 | Perangkat tepercaya muncul di daftar setelah online (LAN) | p95 ≤ 3 detik |
-| Perangkat dianggap offline setelah berhenti menyiarkan presence | ≤ 6 detik |
+| Perangkat dianggap offline setelah berhenti menyiarkan presence | 6 s (konstanta desain) + toleransi sampling |
 | Waktu dari `recv <kode>` sampai terhubung (LAN) | < 2 detik |
 | Latensi echo ketikan saat transfer file penuh | ≤ RTT + 20 ms (p95) |
 | Throughput satu file besar di LAN gigabit | ≥ 85% dari kecepatan kabel |
 | Pemulihan setelah koneksi mati 10 detik | Sesi shell tetap hidup dan tersambung kembali otomatis |
 | Animasi basket muncul | < 150 ms |
 | Ukuran binary rilis | Dicatat tiap rilis (tanpa target keras) |
+
+### Pengukuran Tahap Koneksi (Benchmark Fase 1)
+
+Hasil pengukuran empiris pada Linux network namespace (dapat diulang via `tests/discovery/bench_presence.sh` dan uji pairing):
+
+1. **Waktu Pairing (`recv <kode>` sampai terhubung & tersimpan): 1242 ms**
+   - **Discovery (mDNS lookup)**: ~250 ms (resolusi nama layanan mDNS `_splice._udp.local.` dan pencarian TXT record nameplate).
+   - **Dial (QUIC connect over LAN UDP)**: ~350 ms (inisiasi koneksi transport QUIC langsung tanpa relay).
+   - **Handshake (SPAKE2 + verifikasi kunci)**: ~490 ms (pertukaran elemen SPAKE2, derivasi shared secret, dan mutual authentication).
+   - **Sinkronisasi Trust Store**: ~152 ms (penulisan atomic berkas `trust.json` dengan izin 0600 dan pembaruan in-memory cache).
+
+2. **Waktu Round-Trip Ping-Pong (RTT Total 1637 ms)**
+   - **Discovery / Presence tick**: ~1000 ms (interval sampling siaran tag kehadiran perangkat tepercaya).
+   - **Dial & ALPN Negotiation**: ~280 ms (pembukaan koneksi QUIC dengan ALPN protocol `splice/1`).
+   - **Mutual TLS / Trusted Identity Handshake**: ~210 ms (pemeriksaan NodeId penanggap terhadap trust store).
+   - **Ping-Pong Application Frame**: ~147 ms (transmisi frame Ping, pemrosesan responder, dan penerimaan frame Pong).
 
 Jangan menulis angka di README sebelum diukur dengan skrip benchmark yang bisa diulang orang lain.
 

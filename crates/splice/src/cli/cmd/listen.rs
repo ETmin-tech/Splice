@@ -59,7 +59,7 @@ pub async fn run(cli: &Cli) -> Result<()> {
                     port: beacon_port,
                 };
                 if let Err(err) = presence.send(&beacon).await {
-                    debug!(error=?err, "beacon gagal dikirim");
+                    warn!(error=?err, "beacon gagal dikirim; mencoba lagi di tick berikutnya");
                 }
             }
             datagram = presence.recv() => {
