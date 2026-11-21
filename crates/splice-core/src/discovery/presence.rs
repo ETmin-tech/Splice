@@ -1172,13 +1172,20 @@ mod tests {
         let receiver = PresenceSocket::bind(0).expect("bind an ephemeral presence port");
         let port = receiver.port();
         // One failing interface (192.0.2.1) followed by two working interfaces.
+        // On Linux, loopback aliases (127.0.0.1 and 127.0.0.2) can be used. On macOS/Windows,
+        // loopback aliases are not configured by default, so we use 127.0.0.1 twice to test
+        // multiple working egresses portably without requiring root privileges.
+        #[cfg(target_os = "linux")]
+        let working_egresses = vec![Ipv4Addr::new(127, 0, 0, 1), Ipv4Addr::new(127, 0, 0, 2)];
+        #[cfg(not(target_os = "linux"))]
+        let working_egresses = vec![Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST];
+
+        let mut egresses = vec![Ipv4Addr::new(192, 0, 2, 1)];
+        egresses.extend(working_egresses);
+
         let sender = PresenceSocket::bind(port)
             .expect("bind second socket on the same port")
-            .with_egresses(vec![
-                Ipv4Addr::new(192, 0, 2, 1),
-                Ipv4Addr::new(127, 0, 0, 1),
-                Ipv4Addr::new(127, 0, 0, 2),
-            ]);
+            .with_egresses(egresses);
         let beacon = Beacon {
             tag: tag_for(node(0x5e), bucket_at(Duration::from_secs(0))),
             port: sender.port(),
