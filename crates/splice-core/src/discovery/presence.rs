@@ -468,7 +468,11 @@ impl PresenceSocket {
             .into());
         }
 
-        if let Some(primary) = this.egresses().into_iter().find(|addr| *addr != Ipv4Addr::UNSPECIFIED) {
+        if let Some(primary) = this
+            .egresses()
+            .into_iter()
+            .find(|addr| *addr != Ipv4Addr::UNSPECIFIED)
+        {
             let _ = socket2::SockRef::from(&this.socket).set_multicast_if_v4(&primary);
         }
 
@@ -540,6 +544,10 @@ impl PresenceSocket {
                         state.joined.insert(*addr);
                         tracing::debug!(%addr, "joined multicast on interface");
                     }
+                    Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
+                        state.joined.insert(*addr);
+                        tracing::debug!(%addr, "multicast group already joined on interface");
+                    }
                     Err(err) => {
                         tracing::debug!(%addr, error=?err, "failed to join multicast on interface");
                     }
@@ -588,7 +596,10 @@ impl PresenceSocket {
                 state.egresses = active_loopback;
             } else if wanted.is_empty() || has_provider {
                 state.egresses = Vec::new();
-            } else if sock_ref.join_multicast_v4(&self.group, &Ipv4Addr::UNSPECIFIED).is_ok() {
+            } else if sock_ref
+                .join_multicast_v4(&self.group, &Ipv4Addr::UNSPECIFIED)
+                .is_ok()
+            {
                 state.egresses = vec![Ipv4Addr::UNSPECIFIED];
             } else {
                 state.egresses = Vec::new();
@@ -599,10 +610,7 @@ impl PresenceSocket {
         Ok(())
     }
 
-    fn enumerate_interfaces(
-        &self,
-        _state: &PresenceSocketState,
-    ) -> (Vec<Ipv4Addr>, Vec<Ipv4Addr>) {
+    fn enumerate_interfaces(&self, _state: &PresenceSocketState) -> (Vec<Ipv4Addr>, Vec<Ipv4Addr>) {
         #[cfg(test)]
         if let Some(provider) = &_state.provider {
             let addrs = provider();
@@ -1648,11 +1656,17 @@ mod tests {
             tag: tag_for(node(0x7a), bucket_at(Duration::from_secs(0))),
             port: sender.port(),
         };
-        sender.send(&beacon).await.expect("send beacon on refreshed interface");
+        sender
+            .send(&beacon)
+            .await
+            .expect("send beacon on refreshed interface");
 
         match tokio::time::timeout(Duration::from_secs(3), receiver.recv()).await {
             Ok(Ok((buffer, len, from))) => {
-                assert_eq!(Beacon::decode(&buffer[..len]).map(|b| b.port), Some(beacon.port));
+                assert_eq!(
+                    Beacon::decode(&buffer[..len]).map(|b| b.port),
+                    Some(beacon.port)
+                );
                 assert_eq!(from.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
             }
             Ok(Err(err)) => panic!("recv failed: {err}"),

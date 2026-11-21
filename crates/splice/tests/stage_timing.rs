@@ -13,15 +13,12 @@ use splice_core::net::{NodeAddr, RelaySetting, Transport, REQUIRED_ALPN};
 use splice_core::pairing::{consent_or_refuse, GuestSession, HostSession, PairingPhase};
 use splice_core::proto::messages::{ControlMsg, HelloMode};
 use splice_core::trust::{
-    close_foreign, trusted_hello, TrustEntry, TrustStore, TrustedServer,
-    TrustedStep,
+    close_foreign, trusted_hello, TrustEntry, TrustStore, TrustedServer, TrustedStep,
 };
 use tempfile::TempDir;
 use tokio::time::timeout;
 
-use splice::cli::{
-    apply_step, await_peer_hangup, build_endpoint, read_control, write_control,
-};
+use splice::cli::{apply_step, await_peer_hangup, build_endpoint, read_control, write_control};
 
 const CODE_TEXT: &str = "42-torch-crystal";
 const STEP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -92,7 +89,8 @@ async fn measure_pairing_stages_empirical() {
         let host_addr = dialable(host_ep.as_ref());
 
         let host_code = code(CODE_TEXT);
-        let mut host = HostSession::new(host_id, HelloMode::Pair, host_code, Instant::now()).unwrap();
+        let mut host =
+            HostSession::new(host_id, HelloMode::Pair, host_code, Instant::now()).unwrap();
 
         // Host server task
         let host_task = tokio::spawn({
@@ -107,18 +105,36 @@ async fn measure_pairing_stages_empirical() {
 
                 // 3 handshake steps
                 for _step_name in ["hello", "pake msg", "pake confirm"] {
-                    let msg = timeout(STEP_TIMEOUT, read_control(&mut rx)).await.unwrap().unwrap();
-                    let reply = host.on_message(conn.remote_id(), msg, Instant::now()).unwrap();
+                    let msg = timeout(STEP_TIMEOUT, read_control(&mut rx))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let reply = host
+                        .on_message(conn.remote_id(), msg, Instant::now())
+                        .unwrap();
                     apply_step(&mut tx, reply).await.unwrap();
                 }
 
                 // TrustExchange
-                write_control(&mut tx, &ControlMsg::TrustExchange { alias: "host-dev".into() }).await.unwrap();
-                let guest_msg = timeout(STEP_TIMEOUT, read_control(&mut rx)).await.unwrap().unwrap();
+                write_control(
+                    &mut tx,
+                    &ControlMsg::TrustExchange {
+                        alias: "host-dev".into(),
+                    },
+                )
+                .await
+                .unwrap();
+                let guest_msg = timeout(STEP_TIMEOUT, read_control(&mut rx))
+                    .await
+                    .unwrap()
+                    .unwrap();
                 if let ControlMsg::TrustExchange { .. } = guest_msg {
                     write_control(&mut tx, &ControlMsg::TrustAck).await.unwrap();
                 }
-                let ack = timeout(STEP_TIMEOUT, read_control(&mut rx)).await.unwrap().unwrap();
+                let ack = timeout(STEP_TIMEOUT, read_control(&mut rx))
+                    .await
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(ack, ControlMsg::TrustAck);
                 await_peer_hangup(&mut rx).await;
             }
@@ -144,41 +160,73 @@ async fn measure_pairing_stages_empirical() {
 
         let (mut tx, mut rx) = conn.open_bi().await.unwrap();
         let guest_code = code(CODE_TEXT);
-        let (mut guest, opening) =
-            GuestSession::begin(guest_id, host_id, HelloMode::Pair, guest_code, Instant::now()).unwrap();
+        let (mut guest, opening) = GuestSession::begin(
+            guest_id,
+            host_id,
+            HelloMode::Pair,
+            guest_code,
+            Instant::now(),
+        )
+        .unwrap();
         for msg in &opening {
             write_control(&mut tx, msg).await.unwrap();
         }
 
         // Host PakeMsg
-        let host_share = timeout(STEP_TIMEOUT, read_control(&mut rx)).await.unwrap().unwrap();
-        let step = guest.on_message(host_id, host_share, Instant::now()).unwrap();
+        let host_share = timeout(STEP_TIMEOUT, read_control(&mut rx))
+            .await
+            .unwrap()
+            .unwrap();
+        let step = guest
+            .on_message(host_id, host_share, Instant::now())
+            .unwrap();
         apply_step(&mut tx, step).await.unwrap();
 
         // Host PakeConfirm
-        let host_confirm = timeout(STEP_TIMEOUT, read_control(&mut rx)).await.unwrap().unwrap();
-        let step = guest.on_message(host_id, host_confirm, Instant::now()).unwrap();
+        let host_confirm = timeout(STEP_TIMEOUT, read_control(&mut rx))
+            .await
+            .unwrap()
+            .unwrap();
+        let step = guest
+            .on_message(host_id, host_confirm, Instant::now())
+            .unwrap();
         apply_step(&mut tx, step).await.unwrap();
         assert_eq!(guest.phase(), PairingPhase::Paired);
 
         // Paired repeat
-        let paired = timeout(STEP_TIMEOUT, read_control(&mut rx)).await.unwrap().unwrap();
+        let paired = timeout(STEP_TIMEOUT, read_control(&mut rx))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(paired, ControlMsg::Paired { .. }));
         let t3 = Instant::now();
         s_spake2.record((t3 - t2).as_secs_f64() * 1000.0);
 
         // Trust Exchange
-        let host_alias_msg = timeout(STEP_TIMEOUT, read_control(&mut rx)).await.unwrap().unwrap();
+        let host_alias_msg = timeout(STEP_TIMEOUT, read_control(&mut rx))
+            .await
+            .unwrap()
+            .unwrap();
         let host_alias = match host_alias_msg {
             ControlMsg::TrustExchange { alias } => alias,
             _ => panic!("expected TrustExchange"),
         };
-        write_control(&mut tx, &ControlMsg::TrustExchange { alias: "guest-dev".into() }).await.unwrap();
+        write_control(
+            &mut tx,
+            &ControlMsg::TrustExchange {
+                alias: "guest-dev".into(),
+            },
+        )
+        .await
+        .unwrap();
 
         let consent = consent_or_refuse(&host_alias, host_id).unwrap();
         write_control(&mut tx, &ControlMsg::TrustAck).await.unwrap();
 
-        let host_ack = timeout(STEP_TIMEOUT, read_control(&mut rx)).await.unwrap().unwrap();
+        let host_ack = timeout(STEP_TIMEOUT, read_control(&mut rx))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(host_ack, ControlMsg::TrustAck);
         let t4 = Instant::now();
         s_trust_ex.record((t4 - t3).as_secs_f64() * 1000.0);
@@ -186,7 +234,13 @@ async fn measure_pairing_stages_empirical() {
         // Trust store persist
         let guest_dir = TempDir::new().unwrap();
         let mut store = TrustStore::load_in(guest_dir.path()).unwrap();
-        store.add(TrustEntry::new(host_id, consent.alias.clone(), Duration::ZERO)).unwrap();
+        store
+            .add(TrustEntry::new(
+                host_id,
+                consent.alias.clone(),
+                Duration::ZERO,
+            ))
+            .unwrap();
         store.save().unwrap();
         let t5 = Instant::now();
         s_store.record((t5 - t4).as_secs_f64() * 1000.0);
@@ -198,14 +252,17 @@ async fn measure_pairing_stages_empirical() {
         host_task.await.unwrap();
     }
 
-    print_table("Tahap Pairing (Pairing Breakdown)", &[
-        ("Init & Endpoint Build", &mut s_init),
-        ("Transport Dial (QUIC Handshake)", &mut s_dial),
-        ("SPAKE2 PAKE Handshake", &mut s_spake2),
-        ("Trust Exchange & Consent", &mut s_trust_ex),
-        ("Trust Store Disk Persist (0600)", &mut s_store),
-        ("TOTAL PAIRING (Guest side)", &mut s_total),
-    ]);
+    print_table(
+        "Tahap Pairing (Pairing Breakdown)",
+        &[
+            ("Init & Endpoint Build", &mut s_init),
+            ("Transport Dial (QUIC Handshake)", &mut s_dial),
+            ("SPAKE2 PAKE Handshake", &mut s_spake2),
+            ("Trust Exchange & Consent", &mut s_trust_ex),
+            ("Trust Store Disk Persist (0600)", &mut s_store),
+            ("TOTAL PAIRING (Guest side)", &mut s_total),
+        ],
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -228,7 +285,9 @@ async fn measure_dev_ping_stages_empirical() {
 
         let listener_dir = TempDir::new().unwrap();
         let mut listener_store = TrustStore::load_in(listener_dir.path()).unwrap();
-        listener_store.add(TrustEntry::new(dialer_id, "dialer", Duration::ZERO)).unwrap();
+        listener_store
+            .add(TrustEntry::new(dialer_id, "dialer", Duration::ZERO))
+            .unwrap();
         listener_store.save().unwrap();
 
         // Listener server task
@@ -236,7 +295,11 @@ async fn measure_dev_ping_stages_empirical() {
             let ep = listener_ep.clone();
             let store = listener_store;
             async move {
-                let conn = timeout(STEP_TIMEOUT, ep.accept()).await.unwrap().unwrap().unwrap();
+                let conn = timeout(STEP_TIMEOUT, ep.accept())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
                 let peer = conn.remote_id();
                 if !store.contains(&peer) {
                     close_foreign(conn.as_ref());
@@ -245,7 +308,10 @@ async fn measure_dev_ping_stages_empirical() {
                 let (mut tx, mut rx) = conn.accept_bi().await.unwrap();
                 let mut server = TrustedServer::new(&store, peer);
                 loop {
-                    let msg = timeout(STEP_TIMEOUT, read_control(&mut rx)).await.unwrap().unwrap();
+                    let msg = timeout(STEP_TIMEOUT, read_control(&mut rx))
+                        .await
+                        .unwrap()
+                        .unwrap();
                     match server.on_message(msg) {
                         TrustedStep::Idle => {}
                         TrustedStep::Reply(reply) => {
@@ -265,7 +331,9 @@ async fn measure_dev_ping_stages_empirical() {
         let t0 = Instant::now();
         let dialer_dir = TempDir::new().unwrap();
         let mut dialer_store = TrustStore::load_in(dialer_dir.path()).unwrap();
-        dialer_store.add(TrustEntry::new(listener_id, "listener", Duration::ZERO)).unwrap();
+        dialer_store
+            .add(TrustEntry::new(listener_id, "listener", Duration::ZERO))
+            .unwrap();
         dialer_store.save().unwrap();
         let dialer_ep = lan_endpoint(dialer_secret).await;
         let t1 = Instant::now();
@@ -291,7 +359,10 @@ async fn measure_dev_ping_stages_empirical() {
         // Ping-Pong RTT (ACTUAL APPLICATION RTT)
         let t_ping = Instant::now();
         write_control(&mut tx, &ControlMsg::Ping).await.unwrap();
-        let pong = timeout(STEP_TIMEOUT, read_control(&mut rx)).await.unwrap().unwrap();
+        let pong = timeout(STEP_TIMEOUT, read_control(&mut rx))
+            .await
+            .unwrap()
+            .unwrap();
         let t_pong = Instant::now();
         assert_eq!(pong, ControlMsg::Pong);
 
@@ -304,13 +375,16 @@ async fn measure_dev_ping_stages_empirical() {
         listener_task.await.unwrap();
     }
 
-    print_table("Tahap Dev Ping & RTT Sebenarnya", &[
-        ("Init & Store/Endpoint Build", &mut s_init),
-        ("Transport Dial (QUIC Handshake & TLS)", &mut s_dial),
-        ("Stream Open & Trusted Hello", &mut s_hello),
-        ("Ping-Pong Frame Round-Trip (RTT SEBENARNYA)", &mut s_rtt),
-        ("WAKTU SAMPAI PONG PERTAMA (E2E Direct LAN)", &mut s_total),
-    ]);
+    print_table(
+        "Tahap Dev Ping & RTT Sebenarnya",
+        &[
+            ("Init & Store/Endpoint Build", &mut s_init),
+            ("Transport Dial (QUIC Handshake & TLS)", &mut s_dial),
+            ("Stream Open & Trusted Hello", &mut s_hello),
+            ("Ping-Pong Frame Round-Trip (RTT SEBENARNYA)", &mut s_rtt),
+            ("WAKTU SAMPAI PONG PERTAMA (E2E Direct LAN)", &mut s_total),
+        ],
+    );
 }
 
 fn print_table(title: &str, stages: &[(&str, &mut StageStats)]) {
