@@ -248,3 +248,27 @@ async fn a_corrupt_store_keeps_a_backup_and_trusts_nobody() {
     // listener cannot fall back to "trust everything".
     assert!(TrustStore::load_in(dir.path()).is_err());
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn corrupt_store_with_insecure_permissions_is_rejected_before_quarantine() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("trust.json");
+    // Write a corrupt file with insecure permissions (0644).
+    std::fs::write(&path, b"{ this is corrupt json and insecure").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let err = TrustStore::load_in(dir.path()).expect_err("insecure permissions must be refused");
+    let text = err.to_string();
+    assert!(
+        text.contains("insecure permissions"),
+        "permission check must precede parse and quarantine; got: {text}"
+    );
+    // Because permission check fails before parse, no quarantine backup must be created.
+    assert!(
+        !dir.path().join("trust.json.bak").exists(),
+        "insecure permissions must not quarantine or touch backup"
+    );
+}

@@ -498,10 +498,20 @@ impl PresenceSocket {
 /// interface address explicitly and keep the successes.
 fn join_on_all_interfaces(socket: &socket2::Socket, group: Ipv4Addr) -> Option<Ipv4Addr> {
     let mut candidates = Vec::new();
+    let mut loopback = None;
     if let Ok(interfaces) = if_addrs::get_if_addrs() {
         for interface in interfaces {
+            if interface.is_p2p() {
+                continue;
+            }
             if let IpAddr::V4(addr) = interface.ip() {
-                candidates.push(addr);
+                if addr.is_loopback() {
+                    if socket.join_multicast_v4(&group, &addr).is_ok() && loopback.is_none() {
+                        loopback = Some(addr);
+                    }
+                } else {
+                    candidates.push(addr);
+                }
             }
         }
     }
@@ -510,6 +520,9 @@ fn join_on_all_interfaces(socket: &socket2::Socket, group: Ipv4Addr) -> Option<I
     });
     if egress.is_some() {
         return egress;
+    }
+    if loopback.is_some() {
+        return loopback;
     }
     // Fall back to the kernel's choice: works on a normal single-NIC host
     // even when enumeration is restricted.
@@ -1007,26 +1020,26 @@ mod tests {
         );
     }
 
+    /// Verify that two sockets can bind to the exact same UDP port on this OS.
+    /// On BSD/macOS this requires SO_REUSEPORT as well as SO_REUSEADDR.
+    #[tokio::test]
+    async fn two_sockets_can_share_one_port() {
+        let first = PresenceSocket::bind(0).expect("bind first socket");
+        let port = first.port();
+        assert_ne!(port, 0);
+        let second = PresenceSocket::bind(port).expect("bind second socket on the same port");
+        assert_eq!(first.port(), second.port());
+    }
+
     /// `send` must put real bytes on the wire. Two sockets share the group, so a
     /// beacon sent by one is received by the other; a `send` that returns `Ok(())`
     /// without transmitting leaves the receiver empty.
     #[tokio::test]
     async fn send_actually_transmits_a_beacon() {
-        // Two sockets must share one UDP port. `PRESENCE_PORT` is the real port,
-        // but a stale listener (another test binary, a running daemon) would make
-        // the second bind fail for a reason unrelated to this test, so fall back
-        // to a free ephemeral port: the two sockets only have to agree with each
-        // other, not with the production value.
-        let receiver = match PresenceSocket::bind(PRESENCE_PORT) {
-            Ok(socket) => socket,
-            Err(err) => {
-                eprintln!(
-                    "note: cannot bind PRESENCE_PORT {PRESENCE_PORT} ({err}); \
-                     falling back to an ephemeral port"
-                );
-                PresenceSocket::bind(0).expect("bind an ephemeral presence port")
-            }
-        };
+        // Two sockets must share one UDP port. We bind an ephemeral port (0) for
+        // the receiver so this test never collides with PRESENCE_PORT in other tests;
+        // then the sender binds the EXACT SAME port to verify port reuse.
+        let receiver = PresenceSocket::bind(0).expect("bind an ephemeral presence port");
         let port = receiver.port();
         let sender = PresenceSocket::bind(port).unwrap_or_else(|err| {
             panic!(
