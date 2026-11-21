@@ -7,7 +7,11 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use splice_core::clock::{Clock, SystemClock};
 use splice_core::code::Code;
+use splice_core::discovery::presence::{
+    bucket_at, tag_for, Beacon, PresenceSocket, PresenceTracker,
+};
 use splice_core::identity::NodeSecret;
 use splice_core::net::{NodeAddr, RelaySetting, Transport, REQUIRED_ALPN};
 use splice_core::pairing::{consent_or_refuse, GuestSession, HostSession, PairingPhase};
@@ -383,6 +387,205 @@ async fn measure_dev_ping_stages_empirical() {
             ("Stream Open & Trusted Hello", &mut s_hello),
             ("Ping-Pong Frame Round-Trip (RTT SEBENARNYA)", &mut s_rtt),
             ("WAKTU SAMPAI PONG PERTAMA (E2E Direct LAN)", &mut s_total),
+        ],
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn measure_dev_ping_with_steady_listener_and_presence_discovery() {
+    println!("\n=== MEASURING DEV PING WITH STEADY LISTENER & PRESENCE DISCOVERY (N = {RUNS}) ===");
+
+    let listener_ep = lan_endpoint(NodeSecret::generate()).await;
+    let listener_id = listener_ep.node_id();
+    let listener_addr = dialable(listener_ep.as_ref());
+
+    let listener_dir = TempDir::new().unwrap();
+    let listener_store = Arc::new(std::sync::Mutex::new(
+        TrustStore::load_in(listener_dir.path()).unwrap(),
+    ));
+
+    let presence_listener = PresenceSocket::bind(0).expect("bind presence listener");
+    let presence_port = presence_listener.port();
+
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Background beacon broadcast task (steady state: broadcasting every 1 second)
+    let beacon_task = tokio::spawn({
+        let presence = presence_listener;
+        let stop = stop_flag.clone();
+        let port = listener_addr.port();
+        async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                interval.tick().await;
+                let now = SystemClock.now();
+                let beacon = Beacon {
+                    tag: tag_for(listener_id, bucket_at(now)),
+                    port,
+                };
+                let _ = presence.send(&beacon).await;
+            }
+        }
+    });
+
+    // Background listener accept task (serves Ping/Pong repeatedly for steady listener)
+    let accept_task = tokio::spawn({
+        let ep = listener_ep.clone();
+        let store = listener_store.clone();
+        let stop = stop_flag.clone();
+        async move {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                let conn = match timeout(Duration::from_millis(500), ep.accept()).await {
+                    Ok(Ok(Some(c))) => c,
+                    _ => continue,
+                };
+                let peer = conn.remote_id();
+                let is_trusted = {
+                    let s = store.lock().unwrap();
+                    s.contains(&peer)
+                };
+                if !is_trusted {
+                    close_foreign(conn.as_ref());
+                    continue;
+                }
+                let conn_clone = conn.clone();
+                let store_clone = store.clone();
+                tokio::spawn(async move {
+                    let _keep = conn_clone;
+                    if let Ok((mut tx, mut rx)) = _keep.accept_bi().await {
+                        let mut server = {
+                            let store_guard = store_clone.lock().unwrap();
+                            TrustedServer::new(&store_guard, peer)
+                        };
+                        while let Ok(Ok(msg)) = timeout(STEP_TIMEOUT, read_control(&mut rx)).await {
+                            match server.on_message(msg) {
+                                TrustedStep::Idle => {}
+                                TrustedStep::Reply(reply) => {
+                                    if write_control(&mut tx, &reply).await.is_err() {
+                                        break;
+                                    }
+                                    if reply == ControlMsg::Pong {
+                                        await_peer_hangup(&mut rx).await;
+                                        break;
+                                    }
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    // Wait a brief moment for steady state
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let dialer_secret = NodeSecret::generate();
+    let dialer_id = dialer_secret.public();
+    let raw_secret = dialer_secret.to_bytes();
+    {
+        let mut s = listener_store.lock().unwrap();
+        s.add(TrustEntry::new(dialer_id, "dialer", Duration::ZERO))
+            .unwrap();
+        s.save().unwrap();
+    }
+
+    let presence_dialer = PresenceSocket::bind(presence_port).expect("bind dialer presence");
+
+    let mut s_init = StageStats::default();
+    let mut s_discovery = StageStats::default();
+    let mut s_dial = StageStats::default();
+    let mut s_pingpong = StageStats::default();
+    let mut s_total = StageStats::default();
+
+    for _ in 0..RUNS {
+        // 1. Dialer init & endpoint
+        let t0 = Instant::now();
+        let dialer_dir = TempDir::new().unwrap();
+        let mut dialer_store = TrustStore::load_in(dialer_dir.path()).unwrap();
+        dialer_store
+            .add(TrustEntry::new(listener_id, "listener", Duration::ZERO))
+            .unwrap();
+        dialer_store.save().unwrap();
+        let dialer_ep = lan_endpoint(NodeSecret::from_bytes(raw_secret)).await;
+        let t1 = Instant::now();
+        s_init.record((t1 - t0).as_secs_f64() * 1000.0);
+
+        // 2. Presence Discovery Hint: wait for next beacon on presence_dialer
+        let mut tracker = PresenceTracker::new(Arc::new(SystemClock));
+        tracker.set_trusted(vec![listener_id]);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut discovered_addr: Option<NodeAddr> = None;
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if let Ok(Ok((buffer, len, from))) = timeout(remaining, presence_dialer.recv()).await {
+                if let Some(presence) = tracker.observe(&buffer[..len.min(buffer.len())], from) {
+                    discovered_addr = Some(presence.to_node_addr());
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        let target_addr = match discovered_addr {
+            Some(addr) => addr,
+            None => {
+                eprintln!(
+                    "SKIPPED: runner could not discover beacon via multicast (runner network isolation)"
+                );
+                return;
+            }
+        };
+        let t2 = Instant::now();
+        s_discovery.record((t2 - t1).as_secs_f64() * 1000.0);
+
+        // 3. Transport Dial
+        let conn = timeout(STEP_TIMEOUT, dialer_ep.connect(target_addr, REQUIRED_ALPN))
+            .await
+            .unwrap()
+            .unwrap();
+        let t3 = Instant::now();
+        s_dial.record((t3 - t2).as_secs_f64() * 1000.0);
+
+        // 4. Stream Open, Trusted Hello, Ping-Pong
+        let (mut tx, mut rx) = conn.open_bi().await.unwrap();
+        write_control(&mut tx, &trusted_hello()).await.unwrap();
+        write_control(&mut tx, &ControlMsg::Ping).await.unwrap();
+        let pong = timeout(STEP_TIMEOUT, read_control(&mut rx))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pong, ControlMsg::Pong);
+        let t4 = Instant::now();
+        s_pingpong.record((t4 - t3).as_secs_f64() * 1000.0);
+        s_total.record((t4 - t0).as_secs_f64() * 1000.0);
+
+        drop(tx);
+        drop(rx);
+        drop(conn);
+    }
+
+    stop_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = beacon_task.await;
+    let _ = accept_task.await;
+
+    print_table(
+        "Tahap Dev Ping dengan Listener Steady & Penemuan Presence Multicast (N = 32)",
+        &[
+            ("Init & Store/Endpoint Build", &mut s_init),
+            (
+                "Presence Discovery Hint (Steady Listener)",
+                &mut s_discovery,
+            ),
+            ("Transport Dial (QUIC Handshake & TLS)", &mut s_dial),
+            ("Stream Open & Ping-Pong RTT", &mut s_pingpong),
+            (
+                "WAKTU SAMPAI PONG PERTAMA (via Steady Presence)",
+                &mut s_total,
+            ),
         ],
     );
 }

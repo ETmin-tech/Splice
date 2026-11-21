@@ -317,6 +317,7 @@ async fn decline(
 // ---------------------------------------------------------------------------
 
 async fn join(cli: &Cli, code_str: Option<&str>) -> Result<()> {
+    let t_start = Instant::now();
     let code_str = match code_str {
         Some(code) => code.to_string(),
         None => {
@@ -332,8 +333,10 @@ async fn join(cli: &Cli, code_str: Option<&str>) -> Result<()> {
     let (secret, _source) = load_persistent_identity()?;
     let transport = build_endpoint(secret, relay).await?;
     let node_id = transport.node_id();
+    let t_endpoint = Instant::now();
 
     let host_addr = resolve_host(cli, &code).await?;
+    let t_discovery = Instant::now();
     info!(%node_id, target=?host_addr.id(), "menghubungi host");
 
     let conn = transport
@@ -344,6 +347,7 @@ async fn join(cli: &Cli, code_str: Option<&str>) -> Result<()> {
         anyhow::bail!("ALPN tidak cocok: {:?}", conn.alpn());
     }
     let peer = conn.remote_id();
+    let t_dial = Instant::now();
     info!(%peer, "tersambung");
 
     let (mut tx, mut rx) = conn
@@ -422,6 +426,28 @@ async fn join(cli: &Cli, code_str: Option<&str>) -> Result<()> {
     confirm_trust_ack(&mut tx, &mut rx).await?;
     record_peer(&mut TrustStore::load()?, peer, &consent, SystemClock.now())?;
     println!("✅ {} tersimpan", consent.alias);
+
+    let t_paired = Instant::now();
+    let dt_endpoint = t_endpoint.duration_since(t_start).as_millis();
+    let dt_discovery = t_discovery.duration_since(t_start).as_millis();
+    let dt_dial = t_dial.duration_since(t_start).as_millis();
+    let dt_paired = t_paired.duration_since(t_start).as_millis();
+
+    tracing::info!(
+        target: "splice::timing",
+        endpoint_ms = dt_endpoint,
+        discovery_ms = dt_discovery,
+        dial_ms = dt_dial,
+        paired_ms = dt_paired,
+        "guest pairing stages"
+    );
+
+    if std::env::var_os("SPLICE_TIMING").is_some() {
+        eprintln!(
+            "TIMING guest: endpoint_ready={}ms discovery_done={}ms dial_done={}ms paired={}ms",
+            dt_endpoint, dt_discovery, dt_dial, dt_paired
+        );
+    }
 
     info!("pairing selesai");
     Ok(())

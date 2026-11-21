@@ -357,6 +357,7 @@ async fn guest_ticket(cli: &Cli, raw: &str) -> Result<()> {
 
 /// Ping a trusted device by alias, using the persistent identity.
 async fn ping(cli: &Cli, alias: &str) -> Result<()> {
+    let t_start = Instant::now();
     let store = TrustStore::load()?;
     let entry = store
         .find_by_alias(alias)
@@ -365,13 +366,16 @@ async fn ping(cli: &Cli, alias: &str) -> Result<()> {
 
     let (secret, _source) = load_persistent_identity()?;
     let transport = build_endpoint(secret, resolve_relay(cli)?).await?;
+    let t_endpoint = Instant::now();
 
     let addr = match resolve_addr(cli)? {
         Some(manual) => manual.with_id(target),
         None => presence_hint(target).await?,
     };
+    let t_discovery = Instant::now();
 
     let conn = dial(transport.as_ref(), addr).await?;
+    let t_dial = Instant::now();
     let (mut tx, mut rx) = conn
         .open_bi()
         .await
@@ -382,6 +386,28 @@ async fn ping(cli: &Cli, alias: &str) -> Result<()> {
 
     match read_with_deadline(&mut rx, "Pong").await? {
         ControlMsg::Pong => {
+            let t_pong = Instant::now();
+            let dt_endpoint = t_endpoint.duration_since(t_start).as_millis();
+            let dt_discovery = t_discovery.duration_since(t_start).as_millis();
+            let dt_dial = t_dial.duration_since(t_start).as_millis();
+            let dt_pong = t_pong.duration_since(t_start).as_millis();
+
+            tracing::info!(
+                target: "splice::timing",
+                endpoint_ms = dt_endpoint,
+                discovery_ms = dt_discovery,
+                dial_ms = dt_dial,
+                pong_ms = dt_pong,
+                "dev ping stages"
+            );
+
+            if std::env::var_os("SPLICE_TIMING").is_some() {
+                eprintln!(
+                    "TIMING ping: endpoint_ready={}ms discovery_done={}ms dial_done={}ms pong={}ms",
+                    dt_endpoint, dt_discovery, dt_dial, dt_pong
+                );
+            }
+
             println!("✅ Pong dari {alias} ({})", target.shorthand());
             Ok(())
         }

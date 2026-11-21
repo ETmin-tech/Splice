@@ -372,6 +372,10 @@ struct PresenceSocketState {
     manual_egresses: bool,
     #[cfg(test)]
     provider: Option<std::sync::Arc<dyn Fn() -> Vec<Ipv4Addr> + Send + Sync>>,
+    #[cfg(test)]
+    clock: Option<std::sync::Arc<dyn Fn() -> std::time::Instant + Send + Sync>>,
+    #[cfg(test)]
+    send_attempts: usize,
 }
 
 impl std::fmt::Debug for PresenceSocket {
@@ -450,6 +454,10 @@ impl PresenceSocket {
             manual_egresses: false,
             #[cfg(test)]
             provider: None,
+            #[cfg(test)]
+            clock: None,
+            #[cfg(test)]
+            send_attempts: 0,
         }));
 
         let this = Self {
@@ -606,7 +614,7 @@ impl PresenceSocket {
             }
         }
 
-        state.last_refresh = std::time::Instant::now();
+        state.last_refresh = self.current_time(state);
         Ok(())
     }
 
@@ -660,7 +668,9 @@ impl PresenceSocket {
                 Ok(s) => s,
                 Err(p) => p.into_inner(),
             };
-            state.last_refresh.elapsed() >= INTERFACE_REFRESH_INTERVAL
+            self.current_time(&state)
+                .saturating_duration_since(state.last_refresh)
+                >= INTERFACE_REFRESH_INTERVAL
         };
         if should_periodic {
             let _ = self.refresh_interfaces();
@@ -670,6 +680,13 @@ impl PresenceSocket {
         let bytes = beacon.encode();
 
         let egresses = self.egresses();
+
+        #[cfg(test)]
+        {
+            if let Ok(mut state) = self.state.lock() {
+                state.send_attempts += 1;
+            }
+        }
 
         match send_on_all(&self.socket, &egresses, target, &bytes).await {
             Ok(()) => Ok(()),
@@ -687,6 +704,12 @@ impl PresenceSocket {
                 if self.refresh_interfaces().is_ok() {
                     let refreshed = self.egresses();
                     if !refreshed.is_empty() && refreshed != egresses {
+                        #[cfg(test)]
+                        {
+                            if let Ok(mut state) = self.state.lock() {
+                                state.send_attempts += 1;
+                            }
+                        }
                         return send_on_all(&self.socket, &refreshed, target, &bytes).await;
                     }
                 }
@@ -706,7 +729,9 @@ impl PresenceSocket {
                 Ok(s) => s,
                 Err(p) => p.into_inner(),
             };
-            state.last_refresh.elapsed() >= INTERFACE_REFRESH_INTERVAL
+            self.current_time(&state)
+                .saturating_duration_since(state.last_refresh)
+                >= INTERFACE_REFRESH_INTERVAL
         };
         if should_periodic {
             let _ = self.refresh_interfaces();
@@ -758,6 +783,56 @@ impl PresenceSocket {
         }
         let _ = self.refresh_interfaces();
         self
+    }
+
+    #[cfg(test)]
+    fn current_time(&self, state: &PresenceSocketState) -> std::time::Instant {
+        if let Some(clock) = &state.clock {
+            clock()
+        } else {
+            std::time::Instant::now()
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn current_time(&self, _state: &PresenceSocketState) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
+    #[cfg(test)]
+    pub fn with_clock<F>(self, clock: F) -> Self
+    where
+        F: Fn() -> std::time::Instant + Send + Sync + 'static,
+    {
+        {
+            let mut state = match self.state.lock() {
+                Ok(s) => s,
+                Err(p) => p.into_inner(),
+            };
+            let clock_arc = std::sync::Arc::new(clock);
+            state.last_refresh = clock_arc();
+            state.clock = Some(clock_arc);
+        }
+        self
+    }
+
+    #[cfg(test)]
+    pub fn send_attempts(&self) -> usize {
+        let state = match self.state.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        state.send_attempts
+    }
+
+    #[cfg(test)]
+    pub fn reset_send_attempts(&self) {
+        let mut state = match self.state.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        state.send_attempts = 0;
     }
 }
 
@@ -814,20 +889,28 @@ static LAST_LOGGED: std::sync::Mutex<Option<HashMap<Ipv4Addr, std::time::Instant
 /// Logging at most once per 30 seconds per interface IP avoids flooding the
 /// logs on every tick while preserving diagnostic visibility.
 fn log_interface_error(egress: Ipv4Addr, err: &dyn std::fmt::Display) {
+    let _ = log_interface_error_at(egress, err, std::time::Instant::now());
+}
+
+fn log_interface_error_at(
+    egress: Ipv4Addr,
+    err: &dyn std::fmt::Display,
+    now: std::time::Instant,
+) -> bool {
     let mut guard = match LAST_LOGGED.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
     let map = guard.get_or_insert_with(HashMap::new);
-    let now = std::time::Instant::now();
     let should_log = match map.get(&egress) {
-        Some(last) => now.duration_since(*last) >= Duration::from_secs(30),
+        Some(last) => now.saturating_duration_since(*last) >= Duration::from_secs(30),
         None => true,
     };
     if should_log {
         map.insert(egress, now);
         tracing::warn!(%egress, %err, "multicast beacon send failed on interface");
     }
+    should_log
 }
 
 #[cfg(test)]
@@ -1492,12 +1575,64 @@ mod tests {
     }
 
     #[test]
-    fn log_interface_error_records_and_throttles() {
+    fn log_interface_error_throttles_within_30s_and_allows_after_30s() {
         let test_ip = Ipv4Addr::new(192, 0, 2, 250);
         let err = std::io::Error::other("rate limit test error");
-        log_interface_error(test_ip, &err);
+        let t0 = std::time::Instant::now();
+
+        // 1st call at t0: must log (returns true)
+        let first = log_interface_error_at(test_ip, &err, t0);
+        assert!(first, "first error must be logged");
         assert!(is_interface_logged(test_ip));
+
+        // 2nd call at t0 + 10s (< 30s): must be throttled / suppressed (returns false)
+        let second = log_interface_error_at(test_ip, &err, t0 + Duration::from_secs(10));
+        assert!(!second, "second error within 30s must be suppressed");
+
+        // 3rd call at t0 + 31s (> 30s): must pass and log (returns true)
+        let third = log_interface_error_at(test_ip, &err, t0 + Duration::from_secs(31));
+        assert!(third, "third error after 30s must be logged");
+    }
+
+    #[test]
+    fn log_interface_error_invokes_rate_limited_logger() {
+        let test_ip = Ipv4Addr::new(192, 0, 2, 251);
+        let err = std::io::Error::other("direct test error");
         log_interface_error(test_ip, &err);
+        assert!(
+            is_interface_logged(test_ip),
+            "log_interface_error must invoke rate-limited logger and record entry"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn multicast_join_already_in_use_retains_interface() {
+        let socket = match PresenceSocket::bind(0) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        // Find a physical egress that is NOT loopback
+        let Some(real_iface) = socket
+            .egresses()
+            .into_iter()
+            .find(|a| usable_multicast_interface(*a))
+        else {
+            return;
+        };
+
+        let sock_ref = socket2::SockRef::from(&socket.socket);
+        // Force an OS-level join on this real interface
+        let _ = sock_ref.join_multicast_v4(&socket.group, &real_iface);
+        // Remove from state.joined so refresh_interfaces_locked encounters AddrInUse:
+        socket.state.lock().unwrap().joined.remove(&real_iface);
+
+        let socket = socket.with_interface_provider(move || vec![real_iface]);
+        socket.refresh_interfaces().expect("refresh");
+        assert!(
+            socket.state.lock().unwrap().joined.contains(&real_iface),
+            "joined set must retain {real_iface} when join returns AddrInUse"
+        );
     }
 
     #[test]
@@ -1759,6 +1894,189 @@ mod tests {
         assert!(
             socket.egresses().contains(&Ipv4Addr::LOCALHOST),
             "periodic refresh must pick up 127.0.0.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_sets_multicast_if_to_primary_egress() {
+        let socket = PresenceSocket::bind(0).expect("bind");
+        let primary = socket
+            .egresses()
+            .into_iter()
+            .find(|addr| *addr != Ipv4Addr::UNSPECIFIED)
+            .expect("must have a non-unspecified primary egress");
+        let if_v4 = socket2::SockRef::from(&socket.socket)
+            .multicast_if_v4()
+            .expect("multicast_if_v4");
+        assert_eq!(
+            if_v4, primary,
+            "bound socket must set multicast_if_v4 to primary egress"
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_refresh_counts_provider_calls_strictly_at_interval() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let p_calls = calls.clone();
+        let provider = move || {
+            p_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            vec![Ipv4Addr::LOCALHOST]
+        };
+
+        let now_cell = std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+        let c_now = now_cell.clone();
+        let clock = move || *c_now.lock().unwrap();
+
+        let socket = PresenceSocket::bind(0)
+            .expect("bind")
+            .with_interface_provider(provider)
+            .with_clock(clock);
+
+        // with_interface_provider calls refresh once:
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let beacon = Beacon {
+            tag: tag_for(node(0x7e), bucket_at(Duration::from_secs(0))),
+            port: socket.port(),
+        };
+
+        // Advance 5 seconds (< 10s INTERFACE_REFRESH_INTERVAL).
+        // Must NOT trigger refresh! (If mutated to <, 5s < 10s is true and triggers refresh).
+        {
+            let mut guard = now_cell.lock().unwrap();
+            *guard += Duration::from_secs(5);
+        }
+        let _ = socket.send(&beacon).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no refresh must occur before INTERFACE_REFRESH_INTERVAL (elapsed: 5s)"
+        );
+
+        // Advance past 10 seconds (total elapsed 11s >= 10s).
+        // Exactly one refresh must occur! (If mutated to <, 11s < 10s is false and skips refresh).
+        {
+            let mut guard = now_cell.lock().unwrap();
+            *guard += Duration::from_secs(6);
+        }
+        let _ = socket.send(&beacon).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly one refresh must occur at or after INTERFACE_REFRESH_INTERVAL"
+        );
+
+        // Advance only 2 seconds after the refresh at 11s.
+        // Must NOT trigger refresh!
+        {
+            let mut guard = now_cell.lock().unwrap();
+            *guard += Duration::from_secs(2);
+        }
+        let _ = socket.send(&beacon).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "no refresh before interval expires again"
+        );
+
+        // Now test recv() periodic refresh with the same clock:
+        // Advance 12 seconds past last refresh:
+        {
+            let mut guard = now_cell.lock().unwrap();
+            *guard += Duration::from_secs(12);
+        }
+        // Send a datagram so recv() completes immediately
+        let _ = socket.send(&beacon).await;
+        // The send at +12s triggered a refresh, so calls is now 3:
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        // Advance 15 seconds:
+        {
+            let mut guard = now_cell.lock().unwrap();
+            *guard += Duration::from_secs(15);
+        }
+        // Calling recv() must trigger periodic refresh:
+        let recv_result = tokio::time::timeout(Duration::from_secs(2), socket.recv()).await;
+        assert!(recv_result.is_ok(), "recv must read the datagram");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "recv must trigger periodic refresh when interval elapsed"
+        );
+    }
+
+    #[tokio::test]
+    async fn total_send_failure_retry_condition_evaluates_changed_and_unchanged_egresses() {
+        let unroutable = Ipv4Addr::new(192, 0, 2, 1);
+        let ifaces = std::sync::Arc::new(std::sync::Mutex::new(vec![unroutable]));
+        let socket = PresenceSocket::bind(0)
+            .expect("bind")
+            .with_interface_provider({
+                let ifaces = ifaces.clone();
+                move || ifaces.lock().unwrap().clone()
+            })
+            .with_egresses(vec![unroutable]);
+
+        let beacon = Beacon {
+            tag: tag_for(node(0x7f), bucket_at(Duration::from_secs(0))),
+            port: socket.port(),
+        };
+
+        // Case 1: Egress unchanged on failure (provider still returns unroutable 192.0.2.1).
+        // Under `!refreshed.is_empty() && refreshed != egresses`, retry must NOT be attempted!
+        // send_attempts must be exactly 1.
+        socket.reset_send_attempts();
+        let err = socket.send(&beacon).await.unwrap_err();
+        assert!(
+            err.to_string().contains("192.0.2.1"),
+            "first error must name 192.0.2.1, got: {err}"
+        );
+        assert_eq!(
+            socket.send_attempts(),
+            1,
+            "unchanged egress must not trigger a second send attempt"
+        );
+
+        // Case 2: Egress changed to EMPTY on failure.
+        // Under `&&`: `!refreshed.is_empty()` is false, so it must NOT retry with empty list.
+        // It must return `first_err` which names 192.0.2.1.
+        // Under mutated `||`: `false || true` is true, so it would retry on empty list and report "tried: ".
+        {
+            let mut state = socket.state.lock().unwrap();
+            state.egresses = vec![unroutable];
+            state.manual_egresses = true;
+        }
+        ifaces.lock().unwrap().clear();
+        socket.reset_send_attempts();
+        let err = socket.send(&beacon).await.unwrap_err();
+        assert!(
+            err.to_string().contains("192.0.2.1"),
+            "must return first_err naming 192.0.2.1, got: {err}"
+        );
+        assert_eq!(
+            socket.send_attempts(),
+            1,
+            "empty refreshed egress must not trigger retry"
+        );
+
+        // Case 3: Egress changed to working LOCALHOST.
+        // Under `&&`: both !refreshed.is_empty() and refreshed != egresses are true.
+        // It retries and succeeds!
+        {
+            let mut state = socket.state.lock().unwrap();
+            state.egresses = vec![unroutable];
+            state.manual_egresses = true;
+        }
+        ifaces.lock().unwrap().push(Ipv4Addr::LOCALHOST);
+        socket.reset_send_attempts();
+        socket
+            .send(&beacon)
+            .await
+            .expect("send must retry and succeed on changed working egress");
+        assert_eq!(
+            socket.send_attempts(),
+            2,
+            "changed working egress must trigger retry (total 2 attempts)"
         );
     }
 }

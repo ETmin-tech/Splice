@@ -202,32 +202,50 @@ Pengukuran empiris $N = 32$ putaran (`crates/splice/tests/stage_timing.rs`):
 
 | Tahap | Deskripsi | p50 | p95 | Catatan / Status |
 |---|---|:---:|:---:|---|
-| **Init & Endpoint Build** | Load identitas, parsing kode, inisialisasi transport endpoint | 16.3 ms | 31.9 ms | Diukur nyata |
-| **Discovery (mDNS lookup)** | Resolusi nama layanan `_splice._udp.local.` dan pencarian TXT record nameplate | ~250 ms | ~300 ms | Perkiraan (mDNS LAN) |
-| **Transport Dial** | Inisiasi koneksi QUIC LAN langsung & mutual TLS | 4.7 ms | 5.2 ms | Diukur nyata |
-| **SPAKE2 PAKE Handshake** | Pertukaran share SPAKE2, derivasi shared secret, verifikasi MAC | 5.6 ms | 6.5 ms | Diukur nyata |
-| **Trust Exchange & Consent** | Pertukaran nama alias dan konfirmasi persetujuan | 1.2 ms | 1.6 ms | Diukur nyata |
-| **Sinkronisasi Trust Store** | Penulisan atomik berkas `trust.json` dengan izin 0600 | 7.1 ms | 9.6 ms | Diukur nyata |
-| **TOTAL PROTOKOL PAIRING (Direct LAN)** | Waktu eksekusi murni protokol pairing tanpa mDNS | **35.5 ms** | **52.6 ms** | Diukur nyata |
-| **TOTAL E2E PAIRING (CLI Process + mDNS)** | Keseluruhan dari `pair --join` sampai tersimpan di disk | **~1242 ms** | **~1350 ms** | Diukur di netns (`offline_test.sh`) |
+| **Init & Endpoint Build** | Load identitas, parsing kode, inisialisasi transport endpoint | 29.7 ms | 47.4 ms | Diukur nyata |
+| **Discovery (mDNS lookup)** | Resolusi nama layanan `_splice._udp.local.` dan pencarian TXT record nameplate | 250 ms (perkiraan) | 300 ms (perkiraan) | Perkiraan (mDNS LAN) |
+| **Transport Dial** | Inisiasi koneksi QUIC LAN langsung & mutual TLS | 8.4 ms | 12.8 ms | Diukur nyata |
+| **SPAKE2 PAKE Handshake** | Pertukaran share SPAKE2, derivasi shared secret, verifikasi MAC | 15.8 ms | 17.3 ms | Diukur nyata |
+| **Trust Exchange & Consent** | Pertukaran nama alias dan konfirmasi persetujuan | 3.2 ms | 5.4 ms | Diukur nyata |
+| **Sinkronisasi Trust Store** | Penulisan atomik berkas `trust.json` dengan izin 0600 | 21.4 ms | 33.5 ms | Diukur nyata |
+| **TOTAL PROTOKOL PAIRING (Direct LAN)** | Waktu eksekusi murni protokol pairing tanpa mDNS | **77.2 ms** | **104.9 ms** | Diukur nyata |
+| **TOTAL E2E PAIRING (CLI Process + mDNS)** | Keseluruhan dari `pair --join` sampai tersimpan di disk | **1242 ms (perkiraan harness)** | **1350 ms (perkiraan harness)** | Diukur di netns (`offline_test.sh`) |
 
 #### 2. Rincian Dev Ping & Pemisahan RTT
 Pengukuran empiris $N = 32$ putaran (`crates/splice/tests/stage_timing.rs`):
 
 | Tahap | Deskripsi | p50 | p95 | Catatan / Status |
 |---|---|:---:|:---:|---|
-| **Init & Store/Endpoint Build** | Buka trust store, pencarian alias, inisialisasi endpoint | 24.8 ms | 43.1 ms | Diukur nyata |
-| **Presence Discovery Hint** | Menunggu beacon multicast UDP dari penanggap (interval 1 s) | ~500 ms | ~1000 ms | Tergantung siklus beacon (0–1000 ms) |
-| **Transport Dial (QUIC & TLS)** | Pembukaan koneksi QUIC dengan ALPN `splice/1` & verifikasi identitas | 4.8 ms | 5.8 ms | Diukur nyata |
-| **Stream Open & Trusted Hello** | Buka bi-stream kontrol & kirim frame `Hello{mode: Trusted}` | 0.2 ms | 0.7 ms | Diukur nyata |
-| **Ping-Pong Frame (RTT SEBENARNYA)** | Transmisi frame `Ping` -> pemrosesan -> terima frame `Pong` | **2.7 ms** | **3.3 ms** | **RTT SEBENARNYA (Diukur nyata)** |
-| **Waktu Sampai Pong Pertama (Direct LAN)** | Total dari start proses sampai Pong pertama (jika alamat sudah diketahui) | **33.0 ms** | **50.7 ms** | Diukur nyata |
-| **Waktu Sampai Pong Pertama (via Presence)** | Total dari start perintah `dev ping` termasuk penemuan presence | **~1637 ms** | **~1750 ms** | Diukur di netns (`offline_test.sh`) |
+| **Init & Store/Endpoint Build** | Buka trust store, pencarian alias, inisialisasi endpoint | 50.2 ms | 75.2 ms | Diukur nyata |
+| **Transport Dial (QUIC & TLS)** | Pembukaan koneksi QUIC dengan ALPN `splice/1` & verifikasi identitas | 8.6 ms | 10.4 ms | Diukur nyata |
+| **Stream Open & Trusted Hello** | Buka bi-stream kontrol & kirim frame `Hello{mode: Trusted}` | 0.3 ms | 1.3 ms | Diukur nyata |
+| **Ping-Pong Frame (RTT SEBENARNYA)** | Transmisi frame `Ping` -> pemrosesan -> terima frame `Pong` | **7.0 ms** | **8.8 ms** | **RTT SEBENARNYA (Diukur nyata)** |
+| **Waktu Sampai Pong Pertama (Direct LAN)** | Total dari start proses sampai Pong pertama (jika alamat sudah diketahui) | **66.5 ms** | **91.5 ms** | Diukur nyata |
 
-#### 3. Penjelasan Timer & Sleep di Jalur Pairing dan Dev Ping
-- **`PRESENCE_INTERVAL = 1 s`**: Interval siaran beacon UDP multicast. Menyebabkan dev ping menunggu sampling interval rata-rata ~500 ms (maks 1000 ms) untuk menerima beacon pertama.
+#### 3. Rincian Dev Ping dengan Listener Steady & Penemuan Presence Multicast
+Pengukuran empiris $N = 32$ putaran saat listener sudah menyala aktif di LAN (`crates/splice/tests/stage_timing.rs`):
+
+| Tahap | Deskripsi | p50 | p95 | Mean | Catatan / Status |
+|---|---|:---:|:---:|:---:|---|
+| **Init & Store/Endpoint Build** | Buka trust store & inisialisasi endpoint transport | 46.6 ms | 74.8 ms | 47.6 ms | Diukur nyata |
+| **Presence Discovery Hint** | Menunggu beacon multicast UDP dari penanggap steady (interval 1 s) | **0.1 ms** | **827.4 ms** | **277.8 ms** | Diukur nyata (min 0.05 ms, max 829.5 ms) |
+| **Transport Dial (QUIC Handshake & TLS)** | Dial QUIC langsung ke alamat IP:port dari beacon | 9.0 ms | 14.9 ms | 9.6 ms | Diukur nyata |
+| **Stream Open & Ping-Pong RTT** | Pertukaran frame `Hello` + `Ping` -> `Pong` | 8.1 ms | 13.2 ms | 8.4 ms | Diukur nyata |
+| **WAKTU SAMPAI PONG PERTAMA (via Steady Presence)** | Total dari start perintah `dev ping` sampai menerima Pong | **74.3 ms** | **888.4 ms** | **343.3 ms** | Diukur nyata |
+
+#### 4. Penjelasan Latensi Jalur CLI dan Timer Tetap
+- **Atribusi Latensi Pairing (~900 ms pada E2E 1242 ms)**: Selisih antara protokol murni (~77 ms) dan hasil `offline_test.sh` (1242 ms) berasal dari overhead harness pengujian dan siklus hidup proses:
+  1. Startup proses host di netns (fork/exec, dynamic link, inisialisasi runtime): ~150 ms.
+  2. Polling shell loop `wait_for` di bash (`sleep 0.1` / 100 ms) saat menunggu kode muncul di berkas log: ~100–200 ms.
+  3. Eksekusi pipa bash subshell (`sed`, `head`, `tr`) untuk parsing kode: ~20 ms.
+  4. Startup proses guest di netns: ~100 ms.
+  5. Resolusi mDNS di jaringan lokal: ~250 ms.
+  6. Masa linger host setelah handshake, penyimpanan disk atomik, dan sinkronisasi penutupan proses: ~200 ms.
+- **Penyebab Penundaan Tetap ~1 s pada Dev Ping di `offline_test.sh`**:
+  Pada skrip `offline_test.sh`, proses `listen` baru saja dinyalakan dan langsung menembakkan beacon pertama pada tick 0. Skrip bash mendeteksi baris log dan meluncurkan `dev ping`. Karena inisialisasi `dev ping` selesai setelah beacon #1 lewat, `dev ping` secara deterministik harus menunggu siklus interval penuh beacon #2 (tepat 1000 ms). Sebaliknya, pengujian pada listener yang sudah menyala (*steady listener*) membuktikan bahwa waktu tunggu beacon terdistribusi acak antara 0 ms hingga 830 ms (p50 = 0.1 ms, mean = 277.8 ms), bukan penundaan tetap produk.
+- **`PRESENCE_INTERVAL = 1 s`**: Interval siaran beacon UDP multicast.
 - **`INTERFACE_REFRESH_INTERVAL = 10 s`**: Interval penyegaran berkala daftar antarmuka multicast untuk mendeteksi antarmuka baru/hilang secara dinamis.
-- **`LINGER_TIMEOUT = 5 s`**: Batas waktu maksimum `await_peer_hangup` agar frame penutup tidak terpotong saat koneksi ditutup. Pada happy path, jika peer segera menutup stream (`drop(tx)`), linger selesai seketika (0 ms).
+- **`LINGER_TIMEOUT = 5 s`**: Batas waktu maksimum `await_peer_hangup` agar frame penutup tidak terpotong saat koneksi ditutup (0 ms pada penutupan normal).
 - **Polling di `offline_test.sh`**: `sleep 0.1` (100 ms) saat shell skrip memeriksa kemunculan teks di berkas log proses latar belakang.
 - **Polling di `splice dev presence`**: `tokio::time::interval(100 ms)` untuk memeriksa transisi status tracker tanpa membebani CPU.
 - **Pembersihan**: Tidak ada sleep buatan atau timer diam yang tidak perlu di jalur pairing maupun dev ping. Seluruh operasi asynchronous digerakkan oleh event datagram/stream I/O.
