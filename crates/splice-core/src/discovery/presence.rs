@@ -1362,36 +1362,30 @@ mod tests {
             }
         };
 
-        let has_multicast_if = socket
-            .egresses()
-            .iter()
-            .any(|addr| usable_multicast_interface(*addr));
-
-        let socket = if !has_multicast_if {
-            // Coba dulu IP_MULTICAST_IF=127.0.0.1
-            eprintln!(
-                "runner lacks active IPv4 multicast interface; trying IP_MULTICAST_IF=127.0.0.1"
-            );
-            socket.with_egresses(vec![Ipv4Addr::LOCALHOST])
-        } else {
-            socket
-        };
-
         let beacon = Beacon {
             tag: tag_for(node(0x5a), bucket_at(Duration::from_secs(0))),
             port: socket.port(),
         };
 
-        if let Err(err) = socket.send(&beacon).await {
-            if !has_multicast_if {
-                eprintln!(
-                    "SKIPPED: runner has no active IPv4 multicast interface and loopback failed: {err}{}",
-                    interface_context()
-                );
-                return;
+        // Send a beacon, requiring at least one interface to succeed.
+        // On virtualised runners (e.g. macOS CI without a configured multicast route
+        // on en0), sending on external interfaces fails with EHOSTUNREACH (os error 65).
+        // In that case, fall back to trying IP_MULTICAST_IF=127.0.0.1 first before skipping.
+        let socket = match socket.send(&beacon).await {
+            Ok(()) => socket,
+            Err(err) => {
+                eprintln!("send on host egresses failed ({err}); trying IP_MULTICAST_IF=127.0.0.1");
+                let loopback_socket = socket.with_egresses(vec![Ipv4Addr::LOCALHOST]);
+                if let Err(lb_err) = loopback_socket.send(&beacon).await {
+                    eprintln!(
+                        "SKIPPED: runner has no usable IPv4 multicast interface (host: {err}; loopback: {lb_err}){}",
+                        interface_context()
+                    );
+                    return;
+                }
+                loopback_socket
             }
-            panic!("send failed despite having active multicast interface: {err}");
-        }
+        };
 
         match tokio::time::timeout(Duration::from_secs(5), socket.recv()).await {
             Ok(Ok((buffer, len, _from))) => assert_eq!(
@@ -1400,9 +1394,9 @@ mod tests {
             ),
             Ok(Err(err)) => panic!("recv failed: {err}"),
             Err(_) => {
-                if !has_multicast_if {
+                if socket.egresses() == [Ipv4Addr::LOCALHOST] {
                     eprintln!(
-                        "SKIPPED: multicast datagram not received on loopback (isolated environment){}",
+                        "SKIPPED: multicast datagram not received on loopback (runner isolation){}",
                         interface_context()
                     );
                     return;
