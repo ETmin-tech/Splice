@@ -49,12 +49,13 @@ jobs:
 
       # On macOS runners (Virtualization VM), the loopback interface has no default
       # multicast route (224.0.0.0/4), causing multicast datagram sends to fail with
-      # ENETUNREACH / EADDRNOTAVAIL. Direct multicast traffic to lo0.
+      # ENETUNREACH / EADDRNOTAVAIL / EHOSTUNREACH. Direct multicast traffic to lo0.
       - name: Configure multicast route (macOS)
         if: runner.os == 'macOS'
         run: |
           sudo ifconfig lo0 multicast || true
-          sudo route -nv add -net 224.0.0.0/4 -interface lo0 || sudo route -nv change -net 224.0.0.0/4 -interface lo0 || true
+          sudo route -n add -net 224.0.0.0 -netmask 240.0.0.0 -interface lo0 || sudo route -n change -net 224.0.0.0 -netmask 240.0.0.0 -interface lo0 || true
+          netstat -nr | grep 224 || true
 
       # `pair_then_dev_ping_reaches_the_trusted_device` sets SPLICE_CONFIG_DIR,
       # which is process-global, but it is the only case in the binary that reads
