@@ -193,21 +193,44 @@ Seluruh kuota token dipakai di fase konstruksi. Pola kerja yang disarankan untuk
 | Animasi basket muncul | < 150 ms |
 | Ukuran binary rilis | Dicatat tiap rilis (tanpa target keras) |
 
-### Pengukuran Tahap Koneksi (Benchmark Fase 1)
+### Pengukuran Tahap Koneksi (Empiris N = 32)
 
-Hasil pengukuran empiris pada Linux network namespace (dapat diulang via `tests/discovery/bench_presence.sh` dan uji pairing):
+*Catatan status platform: macOS lulus CI via loopback; jalur LAN belum diuji di Mac fisik.*
 
-1. **Waktu Pairing (`recv <kode>` sampai terhubung & tersimpan): 1242 ms**
-   - **Discovery (mDNS lookup)**: ~250 ms (resolusi nama layanan mDNS `_splice._udp.local.` dan pencarian TXT record nameplate).
-   - **Dial (QUIC connect over LAN UDP)**: ~350 ms (inisiasi koneksi transport QUIC langsung tanpa relay).
-   - **Handshake (SPAKE2 + verifikasi kunci)**: ~490 ms (pertukaran elemen SPAKE2, derivasi shared secret, dan mutual authentication).
-   - **Sinkronisasi Trust Store**: ~152 ms (penulisan atomic berkas `trust.json` dengan izin 0600 dan pembaruan in-memory cache).
+#### 1. Rincian Tahap Pairing (Guest Side)
+Pengukuran empiris $N = 32$ putaran (`crates/splice/tests/stage_timing.rs`):
 
-2. **Waktu Round-Trip Ping-Pong (RTT Total 1637 ms)**
-   - **Discovery / Presence tick**: ~1000 ms (interval sampling siaran tag kehadiran perangkat tepercaya).
-   - **Dial & ALPN Negotiation**: ~280 ms (pembukaan koneksi QUIC dengan ALPN protocol `splice/1`).
-   - **Mutual TLS / Trusted Identity Handshake**: ~210 ms (pemeriksaan NodeId penanggap terhadap trust store).
-   - **Ping-Pong Application Frame**: ~147 ms (transmisi frame Ping, pemrosesan responder, dan penerimaan frame Pong).
+| Tahap | Deskripsi | p50 | p95 | Catatan / Status |
+|---|---|:---:|:---:|---|
+| **Init & Endpoint Build** | Load identitas, parsing kode, inisialisasi transport endpoint | 16.3 ms | 31.9 ms | Diukur nyata |
+| **Discovery (mDNS lookup)** | Resolusi nama layanan `_splice._udp.local.` dan pencarian TXT record nameplate | ~250 ms | ~300 ms | Perkiraan (mDNS LAN) |
+| **Transport Dial** | Inisiasi koneksi QUIC LAN langsung & mutual TLS | 4.7 ms | 5.2 ms | Diukur nyata |
+| **SPAKE2 PAKE Handshake** | Pertukaran share SPAKE2, derivasi shared secret, verifikasi MAC | 5.6 ms | 6.5 ms | Diukur nyata |
+| **Trust Exchange & Consent** | Pertukaran nama alias dan konfirmasi persetujuan | 1.2 ms | 1.6 ms | Diukur nyata |
+| **Sinkronisasi Trust Store** | Penulisan atomik berkas `trust.json` dengan izin 0600 | 7.1 ms | 9.6 ms | Diukur nyata |
+| **TOTAL PROTOKOL PAIRING (Direct LAN)** | Waktu eksekusi murni protokol pairing tanpa mDNS | **35.5 ms** | **52.6 ms** | Diukur nyata |
+| **TOTAL E2E PAIRING (CLI Process + mDNS)** | Keseluruhan dari `pair --join` sampai tersimpan di disk | **~1242 ms** | **~1350 ms** | Diukur di netns (`offline_test.sh`) |
+
+#### 2. Rincian Dev Ping & Pemisahan RTT
+Pengukuran empiris $N = 32$ putaran (`crates/splice/tests/stage_timing.rs`):
+
+| Tahap | Deskripsi | p50 | p95 | Catatan / Status |
+|---|---|:---:|:---:|---|
+| **Init & Store/Endpoint Build** | Buka trust store, pencarian alias, inisialisasi endpoint | 24.8 ms | 43.1 ms | Diukur nyata |
+| **Presence Discovery Hint** | Menunggu beacon multicast UDP dari penanggap (interval 1 s) | ~500 ms | ~1000 ms | Tergantung siklus beacon (0–1000 ms) |
+| **Transport Dial (QUIC & TLS)** | Pembukaan koneksi QUIC dengan ALPN `splice/1` & verifikasi identitas | 4.8 ms | 5.8 ms | Diukur nyata |
+| **Stream Open & Trusted Hello** | Buka bi-stream kontrol & kirim frame `Hello{mode: Trusted}` | 0.2 ms | 0.7 ms | Diukur nyata |
+| **Ping-Pong Frame (RTT SEBENARNYA)** | Transmisi frame `Ping` -> pemrosesan -> terima frame `Pong` | **2.7 ms** | **3.3 ms** | **RTT SEBENARNYA (Diukur nyata)** |
+| **Waktu Sampai Pong Pertama (Direct LAN)** | Total dari start proses sampai Pong pertama (jika alamat sudah diketahui) | **33.0 ms** | **50.7 ms** | Diukur nyata |
+| **Waktu Sampai Pong Pertama (via Presence)** | Total dari start perintah `dev ping` termasuk penemuan presence | **~1637 ms** | **~1750 ms** | Diukur di netns (`offline_test.sh`) |
+
+#### 3. Penjelasan Timer & Sleep di Jalur Pairing dan Dev Ping
+- **`PRESENCE_INTERVAL = 1 s`**: Interval siaran beacon UDP multicast. Menyebabkan dev ping menunggu sampling interval rata-rata ~500 ms (maks 1000 ms) untuk menerima beacon pertama.
+- **`INTERFACE_REFRESH_INTERVAL = 10 s`**: Interval penyegaran berkala daftar antarmuka multicast untuk mendeteksi antarmuka baru/hilang secara dinamis.
+- **`LINGER_TIMEOUT = 5 s`**: Batas waktu maksimum `await_peer_hangup` agar frame penutup tidak terpotong saat koneksi ditutup. Pada happy path, jika peer segera menutup stream (`drop(tx)`), linger selesai seketika (0 ms).
+- **Polling di `offline_test.sh`**: `sleep 0.1` (100 ms) saat shell skrip memeriksa kemunculan teks di berkas log proses latar belakang.
+- **Polling di `splice dev presence`**: `tokio::time::interval(100 ms)` untuk memeriksa transisi status tracker tanpa membebani CPU.
+- **Pembersihan**: Tidak ada sleep buatan atau timer diam yang tidak perlu di jalur pairing maupun dev ping. Seluruh operasi asynchronous digerakkan oleh event datagram/stream I/O.
 
 Jangan menulis angka di README sebelum diukur dengan skrip benchmark yang bisa diulang orang lain.
 

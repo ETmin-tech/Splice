@@ -48,6 +48,9 @@ pub const PRESENCE_GROUP_V4: Ipv4Addr = Ipv4Addr::new(239, 255, 71, 20);
 /// deliberately not 5353 so a host running a stock mDNS daemon still works.
 pub const PRESENCE_PORT: u16 = 47820;
 
+/// Interval between periodic interface refreshes (5-10 s).
+pub const INTERFACE_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
+
 /// Domain separator for the presence key. A rename would break interop; the
 /// string is part of the protocol, not a label.
 pub const PRESENCE_KDF_CONTEXT: &str = "splice presence v1";
@@ -350,15 +353,25 @@ impl PresenceTracker {
 /// Uses `socket2` directly because we need `SO_REUSEADDR` *before* binding (other
 /// processes on the same host must be able to listen too) and multicast group
 /// membership on a specific interface.
+/// A bound presence socket: sends beacons and receives other devices' beacons.
+///
+/// Uses `socket2` directly because we need `SO_REUSEADDR` *before* binding (other
+/// processes on the same host must be able to listen too) and multicast group
+/// membership on a specific interface.
 pub struct PresenceSocket {
     socket: tokio::net::UdpSocket,
     group: std::net::Ipv4Addr,
-    /// Every IPv4 interface the group was joined on, in join order: the usable
-    /// interfaces first, then loopback. A beacon is sent once per entry, so a
-    /// host with Wi-Fi *and* Ethernet reaches peers on both segments instead of
-    /// only the one the kernel would pick. Kept for diagnostics too: a bind that
-    /// succeeds but joins nothing here is the failure mode the tests report.
-    egresses: Vec<std::net::Ipv4Addr>,
+    state: std::sync::Arc<std::sync::Mutex<PresenceSocketState>>,
+}
+
+struct PresenceSocketState {
+    last_refresh: std::time::Instant,
+    joined: std::collections::HashSet<Ipv4Addr>,
+    egresses: Vec<Ipv4Addr>,
+    #[cfg(test)]
+    manual_egresses: bool,
+    #[cfg(test)]
+    provider: Option<std::sync::Arc<dyn Fn() -> Vec<Ipv4Addr> + Send + Sync>>,
 }
 
 impl std::fmt::Debug for PresenceSocket {
@@ -366,7 +379,7 @@ impl std::fmt::Debug for PresenceSocket {
         f.debug_struct("PresenceSocket")
             .field("port", &self.port())
             .field("group", &self.group)
-            .field("egresses", &self.egresses)
+            .field("egresses", &self.egresses())
             .finish()
     }
 }
@@ -426,31 +439,40 @@ impl PresenceSocket {
             })?;
 
         let group = PRESENCE_GROUP_V4;
-        let egresses = join_on_all_interfaces(&socket, group);
-        if egresses.is_empty() {
+        let tokio_socket = tokio::net::UdpSocket::from_std(socket.into())
+            .map_err(|err| DiscoveryError::PresenceSocket(err.to_string()))?;
+
+        let state = std::sync::Arc::new(std::sync::Mutex::new(PresenceSocketState {
+            last_refresh: std::time::Instant::now(),
+            joined: std::collections::HashSet::new(),
+            egresses: Vec::new(),
+            #[cfg(test)]
+            manual_egresses: false,
+            #[cfg(test)]
+            provider: None,
+        }));
+
+        let this = Self {
+            socket: tokio_socket,
+            group,
+            state,
+        };
+
+        this.refresh_interfaces()?;
+
+        if this.egresses().is_empty() {
             return Err(DiscoveryError::MulticastUnavailable(format!(
                 "cannot join {group} on any IPv4 interface{}",
                 interface_context()
             ))
             .into());
         }
-        // Joining only fixes the receive path. Sending without an explicit egress
-        // interface asks the kernel to pick one from the routing table, which
-        // fails with `Network is unreachable` when there is no default route (an
-        // offline network namespace, a client-isolated WLAN). Start from the
-        // first joined interface; `send` walks the whole list and re-pins the
-        // egress before each datagram, so one host can beacon on every segment it
-        // is attached to.
-        if let Some(primary) = egresses.iter().find(|addr| **addr != Ipv4Addr::UNSPECIFIED) {
-            let _ = socket.set_multicast_if_v4(primary);
+
+        if let Some(primary) = this.egresses().into_iter().find(|addr| *addr != Ipv4Addr::UNSPECIFIED) {
+            let _ = socket2::SockRef::from(&this.socket).set_multicast_if_v4(&primary);
         }
-        let socket = tokio::net::UdpSocket::from_std(socket.into())
-            .map_err(|err| DiscoveryError::PresenceSocket(err.to_string()))?;
-        Ok(Self {
-            socket,
-            group,
-            egresses,
-        })
+
+        Ok(this)
     }
 
     /// The bound port (useful when the caller passed 0 in a test).
@@ -468,7 +490,7 @@ impl PresenceSocket {
     /// The first interface joined, or `0.0.0.0` when the kernel chose. This is
     /// the one used for the first datagram; [`Self::egresses`] has the whole list.
     pub fn egress(&self) -> Ipv4Addr {
-        self.egresses
+        self.egresses()
             .first()
             .copied()
             .unwrap_or(Ipv4Addr::UNSPECIFIED)
@@ -476,8 +498,143 @@ impl PresenceSocket {
 
     /// Every interface the group was joined on, in send order. Exposed so a
     /// failed receive or send can name the interfaces it should have used.
-    pub fn egresses(&self) -> &[Ipv4Addr] {
-        &self.egresses
+    pub fn egresses(&self) -> Vec<Ipv4Addr> {
+        let state = match self.state.lock() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
+        state.egresses.clone()
+    }
+
+    /// Refresh the multicast interface list.
+    ///
+    /// Re-enumerates network interfaces, joins multicast group on newly appeared
+    /// interfaces, leaves multicast group on disappeared interfaces, and updates
+    /// the egress list.
+    pub fn refresh_interfaces(&self) -> Result<()> {
+        let mut state = match self.state.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.refresh_interfaces_locked(&mut state)
+    }
+
+    fn refresh_interfaces_locked(&self, state: &mut PresenceSocketState) -> Result<()> {
+        let (candidates, loopback) = self.enumerate_interfaces(state);
+
+        let mut wanted = std::collections::HashSet::new();
+        for addr in &candidates {
+            wanted.insert(*addr);
+        }
+        for addr in &loopback {
+            wanted.insert(*addr);
+        }
+
+        let sock_ref = socket2::SockRef::from(&self.socket);
+
+        // Join newly discovered interfaces
+        for addr in &wanted {
+            if !state.joined.contains(addr) {
+                match sock_ref.join_multicast_v4(&self.group, addr) {
+                    Ok(()) => {
+                        state.joined.insert(*addr);
+                        tracing::debug!(%addr, "joined multicast on interface");
+                    }
+                    Err(err) => {
+                        tracing::debug!(%addr, error=?err, "failed to join multicast on interface");
+                    }
+                }
+            }
+        }
+
+        // Leave disappeared interfaces
+        let to_remove: Vec<Ipv4Addr> = state.joined.difference(&wanted).copied().collect();
+        for addr in to_remove {
+            let _ = sock_ref.leave_multicast_v4(&self.group, &addr);
+            state.joined.remove(&addr);
+            tracing::debug!(%addr, "left multicast on removed interface");
+        }
+
+        // Recompute egresses for sending unless tests pinned them with with_egresses
+        #[cfg(test)]
+        let skip_egress_update = state.manual_egresses;
+        #[cfg(not(test))]
+        let skip_egress_update = false;
+
+        let has_provider = {
+            #[cfg(test)]
+            {
+                state.provider.is_some()
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        };
+
+        if !skip_egress_update {
+            let active_candidates: Vec<Ipv4Addr> = candidates
+                .into_iter()
+                .filter(|a| state.joined.contains(a))
+                .collect();
+            let active_loopback: Vec<Ipv4Addr> = loopback
+                .into_iter()
+                .filter(|a| state.joined.contains(a))
+                .collect();
+
+            if !active_candidates.is_empty() {
+                state.egresses = active_candidates;
+            } else if !active_loopback.is_empty() {
+                state.egresses = active_loopback;
+            } else if wanted.is_empty() || has_provider {
+                state.egresses = Vec::new();
+            } else if sock_ref.join_multicast_v4(&self.group, &Ipv4Addr::UNSPECIFIED).is_ok() {
+                state.egresses = vec![Ipv4Addr::UNSPECIFIED];
+            } else {
+                state.egresses = Vec::new();
+            }
+        }
+
+        state.last_refresh = std::time::Instant::now();
+        Ok(())
+    }
+
+    fn enumerate_interfaces(
+        &self,
+        _state: &PresenceSocketState,
+    ) -> (Vec<Ipv4Addr>, Vec<Ipv4Addr>) {
+        #[cfg(test)]
+        if let Some(provider) = &_state.provider {
+            let addrs = provider();
+            let mut candidates = Vec::new();
+            let mut loopback = Vec::new();
+            for addr in addrs {
+                if addr.is_loopback() {
+                    loopback.push(addr);
+                } else if usable_multicast_interface(addr) {
+                    candidates.push(addr);
+                }
+            }
+            return (candidates, loopback);
+        }
+
+        let mut candidates = Vec::new();
+        let mut loopback = Vec::new();
+        if let Ok(interfaces) = if_addrs::get_if_addrs() {
+            for interface in interfaces {
+                if interface.is_p2p() {
+                    continue;
+                }
+                if let IpAddr::V4(addr) = interface.ip() {
+                    if addr.is_loopback() {
+                        loopback.push(addr);
+                    } else if usable_multicast_interface(addr) {
+                        candidates.push(addr);
+                    }
+                }
+            }
+        }
+        (candidates, loopback)
     }
 
     /// Broadcast one beacon on every joined interface.
@@ -490,8 +647,44 @@ impl PresenceSocket {
     /// interface and its own errno, because "No route to host" alone does not say
     /// which segment failed.
     pub async fn send(&self, beacon: &Beacon) -> Result<()> {
+        let should_periodic = {
+            let state = match self.state.lock() {
+                Ok(s) => s,
+                Err(p) => p.into_inner(),
+            };
+            state.last_refresh.elapsed() >= INTERFACE_REFRESH_INTERVAL
+        };
+        if should_periodic {
+            let _ = self.refresh_interfaces();
+        }
+
         let target = SocketAddr::new(IpAddr::V4(self.group), self.port());
-        send_on_all(&self.socket, &self.egresses, target, &beacon.encode()).await
+        let bytes = beacon.encode();
+
+        let egresses = self.egresses();
+
+        match send_on_all(&self.socket, &egresses, target, &bytes).await {
+            Ok(()) => Ok(()),
+            Err(first_err) => {
+                // If send failed on all current egresses, refresh interfaces immediately and retry.
+                tracing::warn!("all multicast egresses failed to carry beacon; refreshing interfaces immediately");
+                #[cfg(test)]
+                {
+                    if let Ok(mut state) = self.state.lock() {
+                        if state.provider.is_some() {
+                            state.manual_egresses = false;
+                        }
+                    }
+                }
+                if self.refresh_interfaces().is_ok() {
+                    let refreshed = self.egresses();
+                    if !refreshed.is_empty() && refreshed != egresses {
+                        return send_on_all(&self.socket, &refreshed, target, &bytes).await;
+                    }
+                }
+                Err(first_err)
+            }
+        }
     }
 
     /// Wait for one datagram. Returns the bytes and the source address.
@@ -500,6 +693,17 @@ impl PresenceSocket {
     /// observed as such (and rejected by [`Beacon::decode`]) instead of being
     /// silently truncated into a valid-looking frame (I9).
     pub async fn recv(&self) -> Result<([u8; BEACON_LEN + 1], usize, SocketAddr)> {
+        let should_periodic = {
+            let state = match self.state.lock() {
+                Ok(s) => s,
+                Err(p) => p.into_inner(),
+            };
+            state.last_refresh.elapsed() >= INTERFACE_REFRESH_INTERVAL
+        };
+        if should_periodic {
+            let _ = self.refresh_interfaces();
+        }
+
         let mut buffer = [0u8; BEACON_LEN + 1];
         let (len, from) = self
             .socket
@@ -519,8 +723,32 @@ impl PresenceSocket {
     /// `tests` can reach it, so the production egress list stays a property of
     /// the host.
     #[cfg(test)]
-    fn with_egresses(mut self, egresses: Vec<Ipv4Addr>) -> Self {
-        self.egresses = egresses;
+    fn with_egresses(self, egresses: Vec<Ipv4Addr>) -> Self {
+        {
+            let mut state = match self.state.lock() {
+                Ok(s) => s,
+                Err(p) => p.into_inner(),
+            };
+            state.egresses = egresses;
+            state.manual_egresses = true;
+        }
+        self
+    }
+
+    #[cfg(test)]
+    fn with_interface_provider<F>(self, provider: F) -> Self
+    where
+        F: Fn() -> Vec<Ipv4Addr> + Send + Sync + 'static,
+    {
+        {
+            let mut state = match self.state.lock() {
+                Ok(s) => s,
+                Err(p) => p.into_inner(),
+            };
+            state.provider = Some(std::sync::Arc::new(provider));
+            state.manual_egresses = false;
+        }
+        let _ = self.refresh_interfaces();
         self
     }
 }
@@ -570,13 +798,14 @@ async fn send_on_all(
     .into())
 }
 
+static LAST_LOGGED: std::sync::Mutex<Option<HashMap<Ipv4Addr, std::time::Instant>>> =
+    std::sync::Mutex::new(None);
+
 /// Rate-limited warning when a multicast interface fails to send.
 ///
 /// Logging at most once per 30 seconds per interface IP avoids flooding the
 /// logs on every tick while preserving diagnostic visibility.
 fn log_interface_error(egress: Ipv4Addr, err: &dyn std::fmt::Display) {
-    static LAST_LOGGED: std::sync::Mutex<Option<HashMap<Ipv4Addr, std::time::Instant>>> =
-        std::sync::Mutex::new(None);
     let mut guard = match LAST_LOGGED.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
@@ -593,63 +822,13 @@ fn log_interface_error(egress: Ipv4Addr, err: &dyn std::fmt::Display) {
     }
 }
 
-/// Best-effort join on every interface, returning every address that joined.
-///
-/// `join_multicast_v4` with `Ipv4Addr::UNSPECIFIED` lets the kernel pick the
-/// interface for the default route, which is exactly what breaks on a
-/// client-isolated Wi-Fi or an offline network namespace; so we try each
-/// interface address explicitly and keep the successes.
-///
-/// The list is also the send order: usable interfaces first, in enumeration
-/// order. Loopback is only used as a fallback when no real interface joined.
-fn join_on_all_interfaces(socket: &socket2::Socket, group: Ipv4Addr) -> Vec<Ipv4Addr> {
-    let mut candidates = Vec::new();
-    let mut loopback = Vec::new();
-    if let Ok(interfaces) = if_addrs::get_if_addrs() {
-        for interface in interfaces {
-            if interface.is_p2p() {
-                continue;
-            }
-            if let IpAddr::V4(addr) = interface.ip() {
-                if addr.is_loopback() {
-                    loopback.push(addr);
-                } else if usable_multicast_interface(addr) {
-                    candidates.push(addr);
-                }
-            }
-        }
-    }
-    // Join multicast on all real candidate interfaces.
-    let joined = join_all(candidates, |addr| {
-        socket.join_multicast_v4(&group, addr).is_ok()
-    });
-
-    // Also join on loopback so the socket can receive multicast loopback traffic
-    // (used in tests and local listeners).
-    let mut joined_loopback = Vec::new();
-    for addr in loopback {
-        if socket.join_multicast_v4(&group, &addr).is_ok() {
-            joined_loopback.push(addr);
-        }
-    }
-
-    // For sending egresses: active multicast interfaces take precedence.
-    // Loopback is only used as a send egress if no real interface joined.
-    if !joined.is_empty() {
-        return joined;
-    }
-    if !joined_loopback.is_empty() {
-        return joined_loopback;
-    }
-    // Fall back to the kernel's choice: works on a normal single-NIC host
-    // even when enumeration is restricted.
-    if socket
-        .join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)
-        .is_ok()
-    {
-        return vec![Ipv4Addr::UNSPECIFIED];
-    }
-    Vec::new()
+#[cfg(test)]
+fn is_interface_logged(egress: Ipv4Addr) -> bool {
+    let guard = match LAST_LOGGED.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.as_ref().is_some_and(|m| m.contains_key(&egress))
 }
 
 /// Whether a local IPv4 address is one to join multicast on as a *real*
@@ -690,6 +869,7 @@ fn interface_context() -> String {
 /// Order matters: the first entry is the egress tried first, so two runs on the
 /// same host send in the same order. It is a separate function because the
 /// choice is otherwise only reachable through a real NIC.
+#[cfg(test)]
 fn join_all<F>(candidates: impl IntoIterator<Item = Ipv4Addr>, mut join: F) -> Vec<Ipv4Addr>
 where
     F: FnMut(&Ipv4Addr) -> bool,
@@ -1308,7 +1488,19 @@ mod tests {
         let test_ip = Ipv4Addr::new(192, 0, 2, 250);
         let err = std::io::Error::other("rate limit test error");
         log_interface_error(test_ip, &err);
+        assert!(is_interface_logged(test_ip));
         log_interface_error(test_ip, &err);
+    }
+
+    #[test]
+    fn interface_context_formats_diagnostic_string() {
+        let ctx = interface_context();
+        assert!(
+            ctx.starts_with(" (interfaces:")
+                || ctx.starts_with(" (no interfaces")
+                || ctx.starts_with(" (interface enumeration failed:"),
+            "got unexpected interface_context: {ctx:?}"
+        );
     }
 
     /// Verify that two sockets can bind to the exact same UDP port on this OS.
@@ -1417,5 +1609,142 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Item 1: an interface appearing after bind must participate in sending and
+    /// receiving beacons.
+    #[tokio::test]
+    async fn new_interface_appearing_after_bind_is_joined_and_carries_beacons() {
+        let ifaces = std::sync::Arc::new(std::sync::Mutex::new(vec![Ipv4Addr::new(192, 0, 2, 1)]));
+        let receiver = PresenceSocket::bind(0)
+            .expect("bind receiver")
+            .with_interface_provider({
+                let ifaces = ifaces.clone();
+                move || ifaces.lock().unwrap().clone()
+            });
+        let port = receiver.port();
+        let sender = PresenceSocket::bind(port)
+            .expect("bind sender")
+            .with_interface_provider({
+                let ifaces = ifaces.clone();
+                move || ifaces.lock().unwrap().clone()
+            });
+
+        // Initially neither socket has 127.0.0.1
+        // Now new interface 127.0.0.1 appears!
+        ifaces.lock().unwrap().push(Ipv4Addr::LOCALHOST);
+
+        // Refresh sender and receiver
+        sender.refresh_interfaces().expect("refresh sender");
+        receiver.refresh_interfaces().expect("refresh receiver");
+
+        assert!(
+            sender.egresses().contains(&Ipv4Addr::LOCALHOST),
+            "sender must contain 127.0.0.1 in egresses after refresh, got {:?}",
+            sender.egresses()
+        );
+
+        let beacon = Beacon {
+            tag: tag_for(node(0x7a), bucket_at(Duration::from_secs(0))),
+            port: sender.port(),
+        };
+        sender.send(&beacon).await.expect("send beacon on refreshed interface");
+
+        match tokio::time::timeout(Duration::from_secs(3), receiver.recv()).await {
+            Ok(Ok((buffer, len, from))) => {
+                assert_eq!(Beacon::decode(&buffer[..len]).map(|b| b.port), Some(beacon.port));
+                assert_eq!(from.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+            }
+            Ok(Err(err)) => panic!("recv failed: {err}"),
+            Err(_) => panic!("timed out waiting for beacon on newly appeared interface"),
+        }
+    }
+
+    #[tokio::test]
+    async fn disappeared_interface_is_removed_from_egresses() {
+        let ifaces = std::sync::Arc::new(std::sync::Mutex::new(vec![
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::new(192, 0, 2, 1),
+        ]));
+        let socket = PresenceSocket::bind(0)
+            .expect("bind")
+            .with_interface_provider({
+                let ifaces = ifaces.clone();
+                move || ifaces.lock().unwrap().clone()
+            });
+
+        assert!(socket.egresses().contains(&Ipv4Addr::LOCALHOST));
+
+        // 127.0.0.1 disappears from the provider!
+        ifaces.lock().unwrap().retain(|a| *a != Ipv4Addr::LOCALHOST);
+
+        socket.refresh_interfaces().expect("refresh");
+        assert!(
+            !socket.egresses().contains(&Ipv4Addr::LOCALHOST),
+            "127.0.0.1 must be removed from egresses after disappearing, got {:?}",
+            socket.egresses()
+        );
+    }
+
+    #[tokio::test]
+    async fn total_send_failure_triggers_automatic_interface_refresh() {
+        let ifaces = std::sync::Arc::new(std::sync::Mutex::new(vec![Ipv4Addr::new(192, 0, 2, 1)]));
+        let receiver = PresenceSocket::bind(0).expect("bind receiver");
+        let port = receiver.port();
+        let sender = PresenceSocket::bind(port)
+            .expect("bind sender")
+            .with_interface_provider({
+                let ifaces = ifaces.clone();
+                move || ifaces.lock().unwrap().clone()
+            });
+
+        // 192.0.2.1 cannot send. Now 127.0.0.1 appears!
+        ifaces.lock().unwrap().push(Ipv4Addr::LOCALHOST);
+
+        let beacon = Beacon {
+            tag: tag_for(node(0x7b), bucket_at(Duration::from_secs(0))),
+            port: sender.port(),
+        };
+
+        // Notice: we do NOT call refresh_interfaces manually!
+        // send() fails on 192.0.2.1, detects total failure, refreshes interfaces immediately,
+        // discovers 127.0.0.1, retries, and succeeds!
+        sender
+            .send(&beacon)
+            .await
+            .expect("send must automatically refresh on total failure and succeed");
+        assert!(sender.egresses().contains(&Ipv4Addr::LOCALHOST));
+    }
+
+    #[tokio::test]
+    async fn periodic_refresh_updates_interfaces_after_interval() {
+        let ifaces = std::sync::Arc::new(std::sync::Mutex::new(vec![Ipv4Addr::new(192, 0, 2, 1)]));
+        let socket = PresenceSocket::bind(0)
+            .expect("bind")
+            .with_interface_provider({
+                let ifaces = ifaces.clone();
+                move || ifaces.lock().unwrap().clone()
+            });
+
+        // Artificially age the last_refresh timestamp past INTERFACE_REFRESH_INTERVAL
+        {
+            let mut state = socket.state.lock().unwrap();
+            state.last_refresh =
+                std::time::Instant::now() - INTERFACE_REFRESH_INTERVAL - Duration::from_secs(1);
+        }
+
+        ifaces.lock().unwrap().push(Ipv4Addr::LOCALHOST);
+
+        // A send triggers periodic refresh!
+        let beacon = Beacon {
+            tag: tag_for(node(0x7c), bucket_at(Duration::from_secs(0))),
+            port: socket.port(),
+        };
+        let _ = socket.send(&beacon).await;
+
+        assert!(
+            socket.egresses().contains(&Ipv4Addr::LOCALHOST),
+            "periodic refresh must pick up 127.0.0.1"
+        );
     }
 }
