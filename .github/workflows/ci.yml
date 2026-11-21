@@ -47,20 +47,22 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # On macOS runners (Virtualization VM), the loopback interface has no default
-      # multicast route (224.0.0.0/4), causing multicast datagram sends to fail with
-      # ENETUNREACH / EADDRNOTAVAIL / EHOSTUNREACH. Direct multicast traffic to lo0.
-      - name: Configure multicast route (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          sudo ifconfig lo0 multicast || true
-          sudo route -n add -net 224.0.0.0 -netmask 240.0.0.0 -interface lo0 || sudo route -n change -net 224.0.0.0 -netmask 240.0.0.0 -interface lo0 || true
-          netstat -nr | grep 224 || true
+      # There used to be a "Configure multicast route (macOS)" step here that ran
+      # `ifconfig lo0 multicast` and `route add -net 224.0.0.0`. It never worked:
+      # `ifconfig` rejects `multicast` as a value ("bad value") and the multicast
+      # route already points at en0 on the runner (`route add` says "File
+      # exists"). The real defect was in the code: one `send_to` on a single
+      # pinned egress, which fails with EHOSTUNREACH on a NAT'd VM. `send` now
+      # tries every joined interface, loopback included, so no route hack is
+      # needed and none is attempted.
 
       # `pair_then_dev_ping_reaches_the_trusted_device` sets SPLICE_CONFIG_DIR,
       # which is process-global, but it is the only case in the binary that reads
       # the default config location; every other case passes an explicit temp dir
       # to `load_in`. So the default `cargo test` parallel schedule is safe here.
+      #
+      # The presence tests all bind an ephemeral port (0), so they cannot collide
+      # with each other or with PRESENCE_PORT, and no serialisation is needed.
       - name: Test
         # Redirect to a file (portable across the three shells): the digest step
         # below turns a failure into annotations, which anyone can read, whereas

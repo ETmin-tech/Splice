@@ -353,10 +353,12 @@ impl PresenceTracker {
 pub struct PresenceSocket {
     socket: tokio::net::UdpSocket,
     group: std::net::Ipv4Addr,
-    /// The IPv4 interface joined for sending, or `0.0.0.0` for the kernel's
-    /// choice. Kept for diagnostics: a bind that succeeds but joins nothing here
-    /// is the failure mode the tests report.
-    egress: std::net::Ipv4Addr,
+    /// Every IPv4 interface the group was joined on, in join order: the usable
+    /// interfaces first, then loopback. A beacon is sent once per entry, so a
+    /// host with Wi-Fi *and* Ethernet reaches peers on both segments instead of
+    /// only the one the kernel would pick. Kept for diagnostics too: a bind that
+    /// succeeds but joins nothing here is the failure mode the tests report.
+    egresses: Vec<std::net::Ipv4Addr>,
 }
 
 impl std::fmt::Debug for PresenceSocket {
@@ -364,7 +366,7 @@ impl std::fmt::Debug for PresenceSocket {
         f.debug_struct("PresenceSocket")
             .field("port", &self.port())
             .field("group", &self.group)
-            .field("egress", &self.egress)
+            .field("egresses", &self.egresses)
             .finish()
     }
 }
@@ -388,13 +390,23 @@ impl PresenceSocket {
         // `SO_REUSEADDR` alone lets two sockets share a UDP port on Linux, but on
         // the BSDs (macOS included) it does not: the second `bind` fails with
         // `EADDRINUSE`. Several processes on one host must be able to listen
-        // (and the send test opens two sockets on `PRESENCE_PORT`), so ask for
-        // `SO_REUSEPORT` too. It is best-effort: the option does not exist on
-        // every platform and its absence only matters where it is required.
-        #[cfg(unix)]
-        {
-            let _ = socket.set_reuse_port(true);
-        }
+        // (and the two-socket test opens both on one port), so `SO_REUSEPORT` is
+        // required there, not a nicety. The `cfg` mirrors the platforms where
+        // socket2 exposes the option; on those, failing to set it is fatal
+        // because the alternative is a bind that silently cannot be shared.
+        #[cfg(all(
+            unix,
+            not(any(
+                target_os = "solaris",
+                target_os = "illumos",
+                target_os = "cygwin",
+                target_os = "nuttx",
+                target_os = "wasi"
+            ))
+        ))]
+        socket.set_reuse_port(true).map_err(|err| {
+            DiscoveryError::PresenceSocket(format!("cannot enable SO_REUSEPORT: {err}"))
+        })?;
         // Our own beacon must come back to us: on a host that is the only
         // listener, and in the send test where sender and receiver share the
         // port, delivery relies on the multicast loopback. The option defaults
@@ -414,27 +426,30 @@ impl PresenceSocket {
             })?;
 
         let group = PRESENCE_GROUP_V4;
-        let egress = join_on_all_interfaces(&socket, group);
-        let Some(egress) = egress else {
+        let egresses = join_on_all_interfaces(&socket, group);
+        if egresses.is_empty() {
             return Err(DiscoveryError::MulticastUnavailable(format!(
                 "cannot join {group} on any IPv4 interface{}",
                 interface_context()
             ))
             .into());
-        };
+        }
         // Joining only fixes the receive path. Sending without an explicit egress
         // interface asks the kernel to pick one from the routing table, which
         // fails with `Network is unreachable` when there is no default route (an
-        // offline network namespace, a client-isolated WLAN). Pin the egress to
-        // the interface we already joined on; a failure here is not fatal, because
-        // a host with a default route still works without it.
-        let _ = socket.set_multicast_if_v4(&egress);
+        // offline network namespace, a client-isolated WLAN). Start from the
+        // first joined interface; `send` walks the whole list and re-pins the
+        // egress before each datagram, so one host can beacon on every segment it
+        // is attached to.
+        if let Some(primary) = egresses.iter().find(|addr| **addr != Ipv4Addr::UNSPECIFIED) {
+            let _ = socket.set_multicast_if_v4(primary);
+        }
         let socket = tokio::net::UdpSocket::from_std(socket.into())
             .map_err(|err| DiscoveryError::PresenceSocket(err.to_string()))?;
         Ok(Self {
             socket,
             group,
-            egress,
+            egresses,
         })
     }
 
@@ -450,22 +465,33 @@ impl PresenceSocket {
         self.group
     }
 
-    /// The interface used as the multicast egress, or `0.0.0.0` for the kernel's
-    /// choice. Exposed so a failed receive can name the interface it should have
-    /// arrived on.
+    /// The first interface joined, or `0.0.0.0` when the kernel chose. This is
+    /// the one used for the first datagram; [`Self::egresses`] has the whole list.
     pub fn egress(&self) -> Ipv4Addr {
-        self.egress
+        self.egresses
+            .first()
+            .copied()
+            .unwrap_or(Ipv4Addr::UNSPECIFIED)
     }
 
-    /// Broadcast one beacon.
+    /// Every interface the group was joined on, in send order. Exposed so a
+    /// failed receive or send can name the interfaces it should have used.
+    pub fn egresses(&self) -> &[Ipv4Addr] {
+        &self.egresses
+    }
+
+    /// Broadcast one beacon on every joined interface.
+    ///
+    /// A host with Wi-Fi *and* Ethernet is attached to two segments; the kernel
+    /// sends multicast on one interface per datagram, so a single `send_to`
+    /// reaches only the segment of the chosen egress. Re-pinning the egress
+    /// before each datagram covers all of them. A beacon counts as sent when at
+    /// least one interface carried it; if none did, the error names each
+    /// interface and its own errno, because "No route to host" alone does not say
+    /// which segment failed.
     pub async fn send(&self, beacon: &Beacon) -> Result<()> {
-        let bytes = beacon.encode();
         let target = SocketAddr::new(IpAddr::V4(self.group), self.port());
-        self.socket
-            .send_to(&bytes, target)
-            .await
-            .map(|_| ())
-            .map_err(|err| DiscoveryError::PresenceSocket(err.to_string()).into())
+        send_on_all(&self.socket, &self.egresses, target, &beacon.encode()).await
     }
 
     /// Wait for one datagram. Returns the bytes and the source address.
@@ -487,18 +513,74 @@ impl PresenceSocket {
     pub const fn interval() -> Duration {
         PRESENCE_INTERVAL
     }
+
+    /// Test-only: replace the egress list so a test can inject an interface that
+    /// cannot carry a datagram without needing a second NIC. Nothing outside
+    /// `tests` can reach it, so the production egress list stays a property of
+    /// the host.
+    #[cfg(test)]
+    fn with_egresses(mut self, egresses: Vec<Ipv4Addr>) -> Self {
+        self.egresses = egresses;
+        self
+    }
 }
 
-/// Best-effort join on every interface, returning the address to also use as the
-/// egress interface.
+/// Send `bytes` once per egress interface, succeeding if at least one carried it.
+///
+/// Multicast is per-interface: one `send_to` leaves through a single interface,
+/// so a host on two segments needs one datagram each. The egress is re-pinned
+/// with `IP_MULTICAST_IF` immediately before every `send_to`; `UNSPECIFIED`
+/// means "let the kernel pick", which is what the fallback join records.
+///
+/// The error lists every interface with its own errno, because "No route to
+/// host" alone does not say which segment failed — and on a machine we cannot
+/// log into, that list is the whole diagnosis.
+async fn send_on_all(
+    socket: &tokio::net::UdpSocket,
+    egresses: &[Ipv4Addr],
+    target: SocketAddr,
+    bytes: &[u8],
+) -> Result<()> {
+    let mut sent = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    for egress in egresses {
+        if *egress != Ipv4Addr::UNSPECIFIED {
+            if let Err(err) = socket2::SockRef::from(socket).set_multicast_if_v4(egress) {
+                failures.push(format!("{egress}: set egress: {err}"));
+                continue;
+            }
+        }
+        match socket.send_to(bytes, target).await {
+            Ok(_) => sent += 1,
+            Err(err) => failures.push(format!("{egress}: {err}")),
+        }
+    }
+    if sent > 0 {
+        return Ok(());
+    }
+    Err(DiscoveryError::PresenceSocket(format!(
+        "no interface carried the beacon to {target} (tried: {}){}",
+        failures.join(", "),
+        interface_context()
+    ))
+    .into())
+}
+
+/// Best-effort join on every interface, returning every address that joined.
 ///
 /// `join_multicast_v4` with `Ipv4Addr::UNSPECIFIED` lets the kernel pick the
 /// interface for the default route, which is exactly what breaks on a
 /// client-isolated Wi-Fi or an offline network namespace; so we try each
 /// interface address explicitly and keep the successes.
-fn join_on_all_interfaces(socket: &socket2::Socket, group: Ipv4Addr) -> Option<Ipv4Addr> {
+///
+/// The list is also the send order: usable interfaces first, in enumeration
+/// order, then loopback. Loopback is kept even when a real interface joined,
+/// because it is the only egress that can carry a beacon on a host whose NIC
+/// cannot transmit multicast (a virtualised runner behind NAT is the concrete
+/// case: joining `en0` succeeds, sending through it fails with `EHOSTUNREACH`).
+fn join_on_all_interfaces(socket: &socket2::Socket, group: Ipv4Addr) -> Vec<Ipv4Addr> {
     let mut candidates = Vec::new();
-    let mut loopback = None;
+    let mut loopback = Vec::new();
     if let Ok(interfaces) = if_addrs::get_if_addrs() {
         for interface in interfaces {
             if interface.is_p2p() {
@@ -506,36 +588,45 @@ fn join_on_all_interfaces(socket: &socket2::Socket, group: Ipv4Addr) -> Option<I
             }
             if let IpAddr::V4(addr) = interface.ip() {
                 if addr.is_loopback() {
-                    if socket.join_multicast_v4(&group, &addr).is_ok() && loopback.is_none() {
-                        loopback = Some(addr);
-                    }
-                } else {
+                    loopback.push(addr);
+                } else if usable_multicast_interface(addr) {
                     candidates.push(addr);
                 }
             }
         }
     }
-    let egress = first_joined(candidates, |addr| {
+    let mut joined = join_all(candidates, |addr| {
         socket.join_multicast_v4(&group, addr).is_ok()
     });
-    if egress.is_some() {
-        return egress;
+    // Loopback is joined unconditionally, without the `usable_multicast_interface`
+    // filter: `127.0.0.1` is exactly the egress we want as the last resort, so it
+    // must not be skipped like a link-local address would be.
+    for addr in loopback {
+        if socket.join_multicast_v4(&group, &addr).is_ok() {
+            joined.push(addr);
+        }
     }
-    if loopback.is_some() {
-        return loopback;
+    if !joined.is_empty() {
+        return joined;
     }
     // Fall back to the kernel's choice: works on a normal single-NIC host
     // even when enumeration is restricted.
-    socket
+    if socket
         .join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)
-        .ok()
-        .map(|()| Ipv4Addr::UNSPECIFIED)
+        .is_ok()
+    {
+        return vec![Ipv4Addr::UNSPECIFIED];
+    }
+    Vec::new()
 }
 
-/// Whether a local IPv4 address is one to join multicast on.
+/// Whether a local IPv4 address is one to join multicast on as a *real*
+/// interface.
 ///
-/// Loopback has no multicast, and link-local addresses are reached through the
-/// interface's normal address anyway.
+/// Link-local addresses are reached through the interface's normal address
+/// anyway, and loopback has no multicast segment — it is joined separately, as
+/// the last-resort egress, so it must be filtered out here rather than in the
+/// caller.
 fn usable_multicast_interface(addr: Ipv4Addr) -> bool {
     !addr.is_loopback() && !addr.is_link_local()
 }
@@ -562,25 +653,22 @@ fn interface_context() -> String {
     }
 }
 
-/// The first candidate for which `join` succeeds, in input order.
+/// The addresses for which `join` succeeds, in input order.
 ///
-/// Order matters: the egress interface must be the *first* one that works, so
-/// two runs on the same host pick the same interface. It is a separate function
-/// because the choice is otherwise only reachable through a real NIC.
-fn first_joined<F>(candidates: impl IntoIterator<Item = Ipv4Addr>, mut join: F) -> Option<Ipv4Addr>
+/// Order matters: the first entry is the egress tried first, so two runs on the
+/// same host send in the same order. It is a separate function because the
+/// choice is otherwise only reachable through a real NIC.
+fn join_all<F>(candidates: impl IntoIterator<Item = Ipv4Addr>, mut join: F) -> Vec<Ipv4Addr>
 where
     F: FnMut(&Ipv4Addr) -> bool,
 {
-    let mut egress = None;
+    let mut joined = Vec::new();
     for addr in candidates {
-        if !usable_multicast_interface(addr) {
-            continue;
-        }
-        if egress.is_none() && join(&addr) {
-            egress = Some(addr);
+        if join(&addr) {
+            joined.push(addr);
         }
     }
-    egress
+    joined
 }
 
 /// The matching device with the smallest `NodeId`, or `None`.
@@ -921,35 +1009,31 @@ mod tests {
         assert!(usable_multicast_interface(Ipv4Addr::new(10, 0, 0, 1)));
     }
 
-    /// The egress interface must be the *first* address that both is usable and
-    /// joins successfully, so two runs on the same host agree; a later success
-    /// must not replace it, and unusable addresses must be skipped entirely.
+    /// Every success is kept, in input order: the send order must be
+    /// deterministic, and one host can beacon on several segments.
     #[test]
-    fn first_joined_picks_the_first_success_in_order() {
+    fn join_all_keeps_every_success_in_order() {
         let addrs = [
-            Ipv4Addr::new(127, 0, 0, 1),   // loopback: skipped, though it joins
-            Ipv4Addr::new(169, 254, 9, 9), // link-local: skipped, though it joins
-            Ipv4Addr::new(10, 0, 0, 7),    // first usable, joins
-            Ipv4Addr::new(192, 168, 1, 9), // later usable, must not win
+            Ipv4Addr::new(10, 0, 0, 7),    // joins
+            Ipv4Addr::new(192, 168, 1, 9), // joins
+            Ipv4Addr::new(10, 0, 0, 8),    // join fails
+            Ipv4Addr::LOCALHOST,           // joins; the caller decides about it
         ];
-        let picked = first_joined(
-            addrs,
-            // Only the last two ever succeed.
-            |addr| addr.octets()[0] == 10 || addr.octets()[0] == 192,
-        );
-        assert_eq!(picked, Some(Ipv4Addr::new(10, 0, 0, 7)));
-
-        // A failing join propagates to the next candidate.
-        let picked = first_joined(addrs, |addr| addr.octets()[0] == 192);
-        assert_eq!(picked, Some(Ipv4Addr::new(192, 168, 1, 9)));
-
-        // No success at all, and no usable address, both yield `None`.
-        assert_eq!(first_joined(addrs, |_| false), None);
+        let mut tried = Vec::new();
+        let joined = join_all(addrs, |addr| {
+            tried.push(*addr);
+            *addr != Ipv4Addr::new(10, 0, 0, 8)
+        });
         assert_eq!(
-            first_joined([Ipv4Addr::new(127, 0, 0, 1)], |_| true),
-            None,
-            "an unusable address must be skipped even when joining works"
+            joined,
+            vec![
+                Ipv4Addr::new(10, 0, 0, 7),
+                Ipv4Addr::new(192, 168, 1, 9),
+                Ipv4Addr::LOCALHOST
+            ]
         );
+        assert_eq!(tried, addrs.to_vec(), "every candidate must be tried");
+        assert!(join_all(addrs, |_| false).is_empty());
     }
 
     #[test]
@@ -1001,6 +1085,85 @@ mod tests {
         );
     }
 
+    /// A beacon must still leave the host when one egress cannot carry it.
+    ///
+    /// This is the macOS CI failure in miniature: there the NIC joined the group
+    /// but `send_to` through it failed (`EHOSTUNREACH`), and the old code had no
+    /// second attempt, so the beacon never left. `192.0.2.1` (TEST-NET-1) is
+    /// never assigned locally, so pinning the egress to it fails — Linux rejects
+    /// a non-local `IP_MULTICAST_IF` at set time where macOS accepted `en0` and
+    /// failed at send time; either way one egress fails and `send` must move on.
+    ///
+    /// The assertion is on the *source address*: a beacon sent through loopback
+    /// arrives from `127.0.0.1`, one sent through the NIC arrives from the NIC's
+    /// address. Without per-interface egress pinning the datagram takes the NIC
+    /// route and this fails even though a beacon was received.
+    #[tokio::test]
+    async fn send_falls_back_to_the_next_egress_when_one_cannot_be_pinned() {
+        let receiver = PresenceSocket::bind(0).expect("bind an ephemeral presence port");
+        let port = receiver.port();
+        let sender = PresenceSocket::bind(port)
+            .expect("bind a second socket on the same port")
+            .with_egresses(vec![Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::LOCALHOST]);
+        let beacon = Beacon {
+            tag: tag_for(node(0x5b), bucket_at(Duration::from_secs(0))),
+            port: sender.port(),
+        };
+
+        sender
+            .send(&beacon)
+            .await
+            .expect("loopback must carry the beacon after the bogus egress fails");
+
+        match tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await {
+            Ok(Ok((buffer, len, from))) => {
+                assert_eq!(
+                    Beacon::decode(&buffer[..len]).map(|b| b.port),
+                    Some(beacon.port)
+                );
+                assert_eq!(
+                    from.ip(),
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    "the beacon must arrive over the loopback egress, not the NIC"
+                );
+            }
+            Ok(Err(err)) => panic!("recv failed: {err}"),
+            Err(_) => panic!("no beacon within 5 s on port {port}{}", interface_context()),
+        }
+    }
+
+    /// When no egress carries the beacon, `send` must fail and name every
+    /// interface it tried. "No route to host" alone does not say which segment
+    /// failed, and the host that produces it is the one we cannot log into.
+    #[tokio::test]
+    async fn send_names_every_failed_egress_when_none_can_carry_the_beacon() {
+        let egresses = [Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::new(198, 51, 100, 1)];
+        let socket = PresenceSocket::bind(0)
+            .expect("bind an ephemeral presence port")
+            .with_egresses(egresses.to_vec());
+        let beacon = Beacon {
+            tag: tag_for(node(0x5c), bucket_at(Duration::from_secs(0))),
+            port: socket.port(),
+        };
+
+        let err = socket
+            .send(&beacon)
+            .await
+            .expect_err("no local interface can be pinned to either TEST-NET address");
+
+        let message = err.to_string();
+        for egress in egresses {
+            assert!(
+                message.contains(&egress.to_string()),
+                "the error must name {egress}: {message}"
+            );
+        }
+        assert!(
+            message.contains("no interface carried the beacon"),
+            "the error must say what failed: {message}"
+        );
+    }
+
     /// `Debug` must not recurse into the socket; it prints the bound port and the
     /// group, and it must actually print them (a `Debug` that emits nothing would
     /// still compile and would still make every log line useless).
@@ -1022,6 +1185,11 @@ mod tests {
 
     /// Verify that two sockets can bind to the exact same UDP port on this OS.
     /// On BSD/macOS this requires SO_REUSEPORT as well as SO_REUSEADDR.
+    ///
+    /// The option is also *read back*, because a platform where the `cfg` above
+    /// is wrong would otherwise fail only on that platform's CI. Where socket2
+    /// exposes the getter, a `false` here means the bind above succeeded for a
+    /// reason other than the option, and the macOS failure would come back.
     #[tokio::test]
     async fn two_sockets_can_share_one_port() {
         let first = PresenceSocket::bind(0).expect("bind first socket");
@@ -1029,45 +1197,57 @@ mod tests {
         assert_ne!(port, 0);
         let second = PresenceSocket::bind(port).expect("bind second socket on the same port");
         assert_eq!(first.port(), second.port());
+
+        #[cfg(all(
+            unix,
+            not(any(
+                target_os = "solaris",
+                target_os = "illumos",
+                target_os = "cygwin",
+                target_os = "nuttx",
+                target_os = "wasi"
+            ))
+        ))]
+        {
+            let sock = socket2::SockRef::from(&second.socket);
+            assert!(
+                sock.reuse_port().expect("read SO_REUSEPORT back"),
+                "SO_REUSEPORT must be enabled, not merely attempted"
+            );
+            assert!(
+                sock.reuse_address().expect("read SO_REUSEADDR back"),
+                "SO_REUSEADDR must stay enabled on every platform"
+            );
+        }
     }
 
-    /// `send` must put real bytes on the wire. Two sockets share the group, so a
-    /// beacon sent by one is received by the other; a `send` that returns `Ok(())`
-    /// without transmitting leaves the receiver empty.
+    /// `send` must put real bytes on the wire. One socket sends a beacon and
+    /// receives it back through multicast loopback, so the assertion cannot pass
+    /// on a `send` that returns `Ok(())` without transmitting. A single socket is
+    /// used on purpose: with `SO_REUSEPORT` two sockets on one port may share
+    /// delivery differently per platform, which would make the result say more
+    /// about the kernel's reuse policy than about this code.
     #[tokio::test]
     async fn send_actually_transmits_a_beacon() {
-        // Two sockets must share one UDP port. We bind an ephemeral port (0) for
-        // the receiver so this test never collides with PRESENCE_PORT in other tests;
-        // then the sender binds the EXACT SAME port to verify port reuse.
-        let receiver = PresenceSocket::bind(0).expect("bind an ephemeral presence port");
-        let port = receiver.port();
-        let sender = PresenceSocket::bind(port).unwrap_or_else(|err| {
-            panic!(
-                "cannot bind a second socket on port {port} \
-                 (receiver egress {}, receiver group {}): {err}",
-                receiver.egress(),
-                receiver.group()
-            )
-        });
+        let socket = PresenceSocket::bind(0).expect("bind an ephemeral presence port");
         let beacon = Beacon {
             tag: tag_for(node(0x5a), bucket_at(Duration::from_secs(0))),
-            port: sender.port(),
+            port: socket.port(),
         };
 
-        sender.send(&beacon).await.expect("send a beacon");
+        socket.send(&beacon).await.expect("send a beacon");
 
-        match tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await {
+        match tokio::time::timeout(Duration::from_secs(5), socket.recv()).await {
             Ok(Ok((buffer, len, _from))) => assert_eq!(
                 Beacon::decode(&buffer[..len]).map(|b| b.port),
                 Some(beacon.port)
             ),
             Ok(Err(err)) => panic!("recv failed: {err}"),
             Err(_) => panic!(
-                "no beacon within 5 s; receiver egress {}, sender egress {}, \
-                 receiver port {port}, group {}{}",
-                receiver.egress(),
-                sender.egress(),
-                receiver.group(),
+                "no beacon within 5 s; egresses {:?}, port {}, group {}{}",
+                socket.egresses(),
+                socket.port(),
+                socket.group(),
                 interface_context()
             ),
         }
