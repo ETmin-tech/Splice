@@ -619,21 +619,27 @@ fn join_on_all_interfaces(socket: &socket2::Socket, group: Ipv4Addr) -> Vec<Ipv4
             }
         }
     }
-    let mut joined = join_all(candidates, |addr| {
+    // Join multicast on all real candidate interfaces.
+    let joined = join_all(candidates, |addr| {
         socket.join_multicast_v4(&group, addr).is_ok()
     });
-    // Active multicast interfaces take precedence: loopback is only joined as a fallback
-    // when no real IPv4 multicast interface is available.
-    if !joined.is_empty() {
-        return joined;
-    }
+
+    // Also join on loopback so the socket can receive multicast loopback traffic
+    // (used in tests and local listeners).
+    let mut joined_loopback = Vec::new();
     for addr in loopback {
         if socket.join_multicast_v4(&group, &addr).is_ok() {
-            joined.push(addr);
+            joined_loopback.push(addr);
         }
     }
+
+    // For sending egresses: active multicast interfaces take precedence.
+    // Loopback is only used as a send egress if no real interface joined.
     if !joined.is_empty() {
         return joined;
+    }
+    if !joined_loopback.is_empty() {
+        return joined_loopback;
     }
     // Fall back to the kernel's choice: works on a normal single-NIC host
     // even when enumeration is restricted.
