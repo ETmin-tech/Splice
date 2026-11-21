@@ -2,6 +2,7 @@
 
 **Tanggal**: 21 November 2026  
 **Status**: SELESAI (Semua sasaran Fase 1.8 terpenuhi)  
+**Commit HEAD**: `1da6c6a`  
 **Lingkungan Eksekusi**: Linux WSL2 Ubuntu 26.04 x86_64 (`spliceci` non-root), Windows 11  
 **Repositori**: [Splice](https://github.com/ETmin-tech/Splice)
 
@@ -236,6 +237,17 @@ Diverifikasi secara statis dan dinamis bahwa tidak ada `std::sync::MutexGuard` y
   venue=netns relay_mode=disabled runs=32 pass=15 fail=0
   DISCOVERY_BENCH_OK
   ```
+
+### 6.5. Status GitHub Actions CI (Commit `1da6c6a`)
+* **`test (windows-latest)`**: Sukses (Hijau)
+* **`test (macos-latest)`**: Sukses (Hijau)
+* **`test (ubuntu-latest)`**: Sukses (Hijau)
+* **`audit`**: Sukses (Hijau)
+* **`deny`**: Sukses (Hijau)
+* **`docs`**: Sukses (Hijau)
+* **`offline (disabled)`**: Sukses (Hijau)
+* **`offline (default)`**: Sukses (Hijau)
+* **Total**: 8/8 job sukses (100% HIJAU)
 
 ---
 
