@@ -3,7 +3,7 @@
 **Tanggal**: 21 November 2026  
 **Status CI**: **100% HIJAU**  
 **Repositori**: `https://github.com/ETmin-tech/Splice.git` (cabang `main`)  
-**Commit Hash Terverifikasi**: `a106fb8`  
+**Commit Hash Terverifikasi**: `267a789` (`267a7894a6aebe562106e691f65c8f89273c2eda`)  
 
 ---
 
@@ -179,12 +179,79 @@ Berikut rincian 8 mutan yang terlewat pada pengujian mutasi `cargo mutants` modu
 
 ---
 
-## 7. Status Eksekusi dan Verifikasi Penuh
+## 7. Status Eksekusi dan Verifikasi Penuh di HEAD (`267a789`)
 
 ### 7.1. Hasil Pengujian Lokal
-* `cargo test --workspace --no-fail-fast`: **Lulus 100% (245 unit tests splice-core, 9 unit tests splice, 7 cli_e2e tests, 24 pairing invariants, 4 trust invariants, 2 stage timing tests)**.
+* `cargo test --workspace --no-fail-fast`: **Lulus 100% (245 unit tests splice-core, 9 unit tests splice, 7 cli_e2e tests, 2 stage timing tests, 24 pairing invariants, 4 trust invariants)**.
 * `cargo clippy --workspace --all-targets -- -D warnings`: **0 warning (bersih sempurna)**.
 * `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`: **Lulus tanpa peringatan**.
+* `cargo fmt --check`: **Lulus 100% tanpa perbedaan format**.
 
-### 7.2. Status CI GitHub Actions
-Seluruh alur kerja GitHub Actions berjalan pada commit Fase 1.7 dengan status hijau penuh (**100% SUCCESS**).
+### 7.2. Pengujian Mutasi (`cargo mutants` pada `presence.rs`)
+Dijalankan di Linux WSL di bawah pengguna non-root `spliceci` (`TMPDIR=/home/spliceci/tmp cargo mutants -d crates/splice-core -f presence.rs --no-times -- -- discovery::presence`):
+* **Total Mutan Diuji**: 138 mutan
+* **Tertangkap (Caught)**: 97 mutan
+* **Tidak Viabel (Unviable / Compile Error)**: 36 mutan
+* **Terlewat (Missed)**: 5 mutan (turun dari 8 pada Fase 1.6)
+
+Daftar 5 mutan yang terlewat:
+1. `presence.rs:474:32: replace != with == in PresenceSocket::bind`  
+   *Penyebab*: Merupakan pengaturan interface default awal pada soket. Saat pengiriman beacon dilakukan, `send_on_all` melakukan re-pinning interface spesifik (`IP_MULTICAST_IF`) untuk tiap datagram, sehingga pilihan awal tidak mempengaruhi pengiriman.
+2. `presence.rs:663:42: replace >= with < in PresenceSocket::send`  
+   *Penyebab*: Pengecekan interval penyegaran berkala (`elapsed >= INTERFACE_REFRESH_INTERVAL`). Pembalikan kondisi menjadi `<` menyebabkan soket melakukan refresh lebih sering di setiap send tanpa merusak kebenaran data beacon.
+3. `presence.rs:689:46: replace && with || in PresenceSocket::send`  
+   *Penyebab*: Kondisi pembanding pada saat retry setelah total send failure. Pada pengujian satu interface lokal, kondisi fallback tetap berhasil menjalankan retry.
+4. `presence.rs:709:42: replace >= with < in PresenceSocket::recv`  
+   *Penyebab*: Serupa dengan mutan send, pembalikan kondisi hanya memicu pemeriksaan refresh lebih awal saat menerima paket tanpa mempengaruhi operasi pembacaan buffer UDP.
+5. `presence.rs:824:49: replace >= with < in log_interface_error`  
+   *Penyebab*: Interval penekanan (throttling) log diagnostik internal. Mutasi hanya mengubah frekuensi pencetakan pesan peringatan, tanpa efek samping terhadap state fungsional soket.
+
+### 7.3. Pengujian Offline dan Benchmark di WSL Linux (HEAD: `267a789`)
+Dijalankan di WSL Ubuntu non-root (`spliceci` / netns harness):
+* **Uji Offline (`tests/offline/offline_test.sh`)**:
+  - Mode `SPLICE_RELAY_MODE=disabled`: **19 pass, 0 fail; `pair_ms=1224`, `ping_ms=1620`, status `OFFLINE_OK`**.
+  - Mode `SPLICE_RELAY_MODE=default`: **19 pass, 0 fail; `pair_ms=1223`, `ping_ms=1619`, status `OFFLINE_OK`**.
+* **Benchmark Penemuan Presence (`tests/discovery/bench_presence.sh`, $N = 32$)**:
+  - `online_ms`: n=32, min=80 ms, p50=81 ms, p95=106 ms, max=106 ms, mean=90.56 ms.
+  - `offline_ms`: n=32, min=5979 ms, p50=5995 ms, p95=6010 ms, max=6013 ms, mean=5996.53 ms.
+  - Status: **`DISCOVERY_BENCH_OK`**.
+
+### 7.4. Status CI GitHub Actions
+
+Semua alur kerja di GitHub Actions untuk commit `267a789` selesai dengan status hijau penuh (**100% SUCCESS**):
+
+#### Alur Kerja `ci.yml` (Run ID: [44892579912](https://github.com/ETmin-tech/Splice/actions/runs/44892579912))
+* `docs`: **SUCCESS**
+* `test (ubuntu-latest)`: **SUCCESS**
+* `test (macos-latest)`: **SUCCESS**
+* `test (windows-latest)`: **SUCCESS**
+* `deny`: **SUCCESS**
+* `audit`: **SUCCESS**
+
+#### Alur Kerja `offline.yml` (Run ID: [44892579972](https://github.com/ETmin-tech/Splice/actions/runs/44892579972))
+* `offline (disabled)`: **SUCCESS**
+* `offline (default)`: **SUCCESS**
+
+### 7.5. Rincian Hasil Per-Target Tes di macOS (`macos-latest`)
+Berdasarkan log eksekusi `test (macos-latest)` pada commit `267a789`:
+* `spikes/iroh-offline` (unittests `src/main.rs`): **1 passed, 0 failed**
+* `splice` (unittests `src/lib.rs`): **9 passed, 0 failed**
+* `splice` (unittests `src/main.rs`): **0 passed, 0 failed**
+* `splice` (`tests/cli_e2e.rs`): **7 passed, 0 failed**
+* `splice` (`tests/stage_timing.rs`): **2 passed, 0 failed**
+* `splice-core` (unittests `src/lib.rs`): **245 passed, 0 failed**
+* `splice-core` (`tests/pairing_invariants.rs`): **24 passed, 0 failed**
+* `splice-core` (`tests/trust_invariants.rs`): **4 passed, 0 failed**
+* `Doc-tests splice`: **0 passed, 0 failed**
+* `Doc-tests splice_core`: **0 passed, 0 failed**
+* **Total Keseluruhan macOS**: **288 passed, 0 failed (100% Lulus)**.
+
+---
+
+## 8. Ringkasan Kesimpulan dan Kesiapan
+
+Fase 1.7 berhasil menyempurnakan keandalan Splice pada lapisan jaringan multicast dinamis:
+1. Soket presence secara otomatis menyegarkan antarmuka multicast tiap 10 detik dan segera saat terjadi kegagalan kirim total, bergabung ulang pada antarmuka baru dan membersihkan antarmuka usang.
+2. Penanganan `AddrInUse` memastikan pendaftaran keanggotaan multicast bersifat idempoten tanpa menimbulkan kegagalan egress semu.
+3. Waktu pairing dan ping dev kini terukur secara empiris dengan presisi tinggi pada transport QUIC riil, membedakan secara jelas antara RTT frame aplikasi (2.69 ms) dan latensi pencarian peer.
+4. Semua 8 pekerjaan CI GitHub Actions hijau sempurna, dan seluruh batasan diverifikasi secara transparan.
