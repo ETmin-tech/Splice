@@ -76,39 +76,45 @@ jobs:
         if: always()
         shell: bash
         run: |
-          echo "=== Per-target test results (${{ matrix.os }}) ==="
-          grep -E "(Running |Doc-tests |test result:)" test-output.txt || cat test-output.txt
-          if [ -n "$GITHUB_STEP_SUMMARY" ]; then
-            {
-              echo "### Per-target test results (${{ matrix.os }})"
-              echo '```'
-              grep -E "(Running |Doc-tests |test result:)" test-output.txt || cat test-output.txt
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
+          if [ -f test-output.txt ]; then
+            echo "=== Per-target test results (${{ matrix.os }}) ==="
+            grep -E "(Running |Doc-tests |test result:)" test-output.txt || cat test-output.txt
+            if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+              {
+                echo "### Per-target test results (${{ matrix.os }})"
+                echo '```'
+                grep -E "(Running |Doc-tests |test result:)" test-output.txt || cat test-output.txt
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            echo "test-output.txt not found (earlier build step failed)"
           fi
 
       - name: Test failure digest
         if: failure()
         shell: bash
         run: |
-          echo "=== failing tests ==="
-          awk '/^---- .* stdout ----/{flag=1; count=0} flag{print; count++; if(count>60) flag=0}' test-output.txt | while IFS= read -r line; do
-            echo "::error::$line"
-          done
-          # A host summary as an annotation too: the raw log is not public, and
-          # macOS is the one platform we cannot reproduce locally.
-          {
-            echo "host: $(uname -srm 2>/dev/null || echo unknown)"
-            echo "--- routes"
-            netstat -nr 2>/dev/null | head -30 || true
-            echo "--- interfaces"
-            ifconfig 2>/dev/null | grep -E '^[a-z]|inet ' | head -40 || true
-          } > host-summary.txt
-          while IFS= read -r line; do
-            echo "::notice::$line"
-          done < host-summary.txt
-          echo "=== last 150 lines of test output ==="
-          tail -150 test-output.txt || true
+          if [ -f test-output.txt ]; then
+            echo "=== failing tests ==="
+            awk '/^---- .* stdout ----/{flag=1; count=0} flag{print; count++; if(count>60) flag=0}' test-output.txt | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            # A host summary as an annotation too: the raw log is not public, and
+            # macOS is the one platform we cannot reproduce locally.
+            {
+              echo "host: $(uname -srm 2>/dev/null || echo unknown)"
+              echo "--- routes"
+              netstat -nr 2>/dev/null | head -30 || true
+              echo "--- interfaces"
+              ifconfig 2>/dev/null | grep -E '^[a-z]|inet ' | head -40 || true
+            } > host-summary.txt
+            while IFS= read -r line; do
+              echo "::notice::$line"
+            done < host-summary.txt
+            echo "=== last 150 lines of test output ==="
+            tail -150 test-output.txt || true
+          fi
 
       - name: Upload test output
         if: always()

@@ -1293,7 +1293,7 @@ mod tests {
     #[test]
     fn log_interface_error_records_and_throttles() {
         let test_ip = Ipv4Addr::new(192, 0, 2, 250);
-        let err = std::io::Error::new(std::io::ErrorKind::Other, "rate limit test error");
+        let err = std::io::Error::other("rate limit test error");
         log_interface_error(test_ip, &err);
         log_interface_error(test_ip, &err);
     }
